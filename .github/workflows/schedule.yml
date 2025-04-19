@@ -1,0 +1,36 @@
+name: Daily Todoist AI Scheduler
+
+on:
+  schedule:
+    # Runs daily at 09:00 UTC (05:00 America/Toronto during EDT)
+    - cron: '0 9 * * *'
+  workflow_dispatch:  # Enables manual trigger via the "Run workflow" button
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run AI Scheduler
+        run: |
+          source venv/bin/activate
+          python ai_scheduler.py
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TODOIST_API_TOKEN: ${{ secrets.TODOIST_API_TOKEN }}
+
