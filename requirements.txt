@@ -1,5 +1,6 @@
+openai>=1.0.0
+requests
 python-dotenv
-openai>=0.27.0
 todoist-api-python
 pytz
 workalendar
