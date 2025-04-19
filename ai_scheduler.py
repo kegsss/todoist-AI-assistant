@@ -1,4 +1,3 @@
-```python
 #!/usr/bin/env python3
 import os
 import sys
@@ -27,7 +26,7 @@ with open("config.yaml", "r") as f:
 tz = pytz.timezone(cfg["timezone"])
 now = datetime.now(tz)
 today_str = now.date().isoformat()
-max_date = (now.date() + timedelta(days=cfg["schedule_horizon_days"])) .isoformat()
+max_date = (now.date() + timedelta(days=cfg["schedule_horizon_days"])).isoformat()
 
 # —— Todoist v2 API settings ——
 TODOIST_BASE = "https://api.todoist.com/rest/v2"
@@ -41,7 +40,12 @@ client = OpenAI(api_key=OPENAI_KEY)
 
 # —— Helpers ——
 def get_unscheduled_tasks():
-    """Fetch tasks with no due date or with a past due date (stale) and return them."""
+    """
+    Fetch non-recurring tasks in the project that either:
+     - have no due date, or
+     - have a past due date (overdue).
+    Include their current priority.
+    """
     resp = requests.get(
         f"{TODOIST_BASE}/tasks",
         headers=HEADERS,
@@ -50,7 +54,12 @@ def get_unscheduled_tasks():
     resp.raise_for_status()
     tasks = resp.json()
     return [
-        t for t in tasks
+        {
+            "id": t["id"],
+            "content": t["content"],
+            "priority": t.get("priority", 1)
+        }
+        for t in tasks
         if not t.get("recurring", False)
         and (
             t.get("due") is None
@@ -61,7 +70,7 @@ def get_unscheduled_tasks():
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
 def call_openai(messages, functions=None):
-    """Call OpenAI: try nano first, fallback to mini if rate limited."""
+    """Call OpenAI chat endpoint: try nano first, fallback to mini if rate‑limited."""
     try:
         resp = client.chat.completions.create(
             model="gpt-4.1-nano",
@@ -79,67 +88,77 @@ def call_openai(messages, functions=None):
         )
     return resp.choices[0].message
 
-
 def make_schedule_function():
     return {
-      "name": "assign_due_dates",
-      "description": "Assign due dates for tasks over a date range.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "tasks": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "id": {"type": "string"},
-                "due_date": {"type": "string", "format": "date"}
-              },
-              "required": ["id", "due_date"]
-            }
-          }
-        },
-        "required": ["tasks"]
-      }
+        "name": "assign_due_dates",
+        "description": "Assign due dates for tasks over a date range, "
+                       "scheduling higher‑priority tasks earlier.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "priority": {"type": "integer", "minimum": 1, "maximum": 4},
+                            "due_date": {"type": "string", "format": "date"}
+                        },
+                        "required": ["id", "priority", "due_date"]
+                    }
+                }
+            },
+            "required": ["tasks"]
+        }
     }
-
 
 def make_priority_function():
     return {
-      "name": "set_priorities",
-      "description": "Set priority 1–4 for tasks based on importance.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "tasks": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "id": {"type": "string"},
-                "priority": {"type": "integer", "minimum": 1, "maximum": 4}
-              },
-              "required": ["id", "priority"]
-            }
-          }
-        },
-        "required": ["tasks"]
-      }
+        "name": "set_priorities",
+        "description": "Set priority 1–4 for tasks based on importance.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "priority": {"type": "integer", "minimum": 1, "maximum": 4}
+                        },
+                        "required": ["id", "priority"]
+                    }
+                }
+            },
+            "required": ["tasks"]
+        }
     }
 
-# —— 1) Auto‑schedule unscheduled & stale tasks ——
+# —— 1) Auto‑schedule unscheduled & overdue tasks ——
 unscheduled = get_unscheduled_tasks()
 if unscheduled:
-    task_info = [{"id": t["id"], "content": t["content"]} for t in unscheduled]
+    # Prepare info with priorities included
+    task_info = [
+        {"id": t["id"], "content": t["content"], "priority": t["priority"]}
+        for t in unscheduled
+    ]
     messages = [
-        {"role": "system", "content": "You are an AI that schedules Todoist tasks."},
-        {"role": "user", "content": (
-            f"Today is {today_str}. Here are tasks with no due date or overdue:"
-            f"\n{json.dumps(task_info, indent=2)}\n"
-            f"Assign each a 'due_date' between {today_str} and {max_date}, "
-            f"with at most {cfg['max_tasks_per_day']} tasks per day. "
-            "Return a JSON object with key 'tasks', an array of {id, due_date}."
-        )}
+        {
+            "role": "system",
+            "content": "You are an AI that schedules Todoist tasks, "
+                       "and you should place higher‑priority tasks earlier in the date range."
+        },
+        {
+            "role": "user",
+            "content":
+                f"Today is {today_str}. Here are tasks with no due date or overdue:\n"
+                f"{json.dumps(task_info, indent=2)}\n"
+                f"Assign each a due_date between {today_str} and {max_date}, "
+                f"with at most {cfg['max_tasks_per_day']} tasks per day. "
+                "Return a JSON object with key 'tasks', an array of {id, priority, due_date}."
+        }
     ]
     fn = make_schedule_function()
     message = call_openai(messages, functions=[fn])
@@ -171,10 +190,10 @@ todays = [
 if todays:
     messages = [
         {"role": "system", "content": "You are a productivity coach for Todoist."},
-        {"role": "user", "content": (
+        {"role": "user", "content":
             f"Rank these tasks by importance for today:\n{json.dumps(todays, indent=2)}\n"
             "Return a JSON object with key 'tasks', an array of {id, priority}."
-        )}
+        }
     ]
     fn2 = make_priority_function()
     message2 = call_openai(messages, functions=[fn2])
@@ -190,5 +209,3 @@ if todays:
         ).raise_for_status()
 
 print("✅ Live run complete.")
-```
-
