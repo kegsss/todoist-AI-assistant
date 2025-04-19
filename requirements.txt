@@ -5,3 +5,4 @@ todoist-api-python
 pytz
 workalendar
 tenacity
+PyYAML
