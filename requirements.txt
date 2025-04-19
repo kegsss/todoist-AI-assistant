@@ -1,0 +1,6 @@
+python-dotenv
+openai>=0.27.0
+todoist-api-python
+pytz
+workalendar
+tenacity
