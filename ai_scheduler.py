@@ -1,3 +1,4 @@
+```python
 #!/usr/bin/env python3
 import os
 import sys
@@ -11,7 +12,7 @@ import openai
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# —— Load environment & config —— 
+# —— Load environment & config ——
 load_dotenv()
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 TODOIST_TOKEN = os.getenv("TODOIST_API_TOKEN")
@@ -22,19 +23,25 @@ if not OPENAI_KEY or not TODOIST_TOKEN:
 with open("config.yaml", "r") as f:
     cfg = yaml.safe_load(f)
 
-# —— Todoist v2 API settings —— 
+# —— Compute dates based on your timezone ——
+tz = pytz.timezone(cfg["timezone"])
+now = datetime.now(tz)
+today_str = now.date().isoformat()
+max_date = (now.date() + timedelta(days=cfg["schedule_horizon_days"])) .isoformat()
+
+# —— Todoist v2 API settings ——
 TODOIST_BASE = "https://api.todoist.com/rest/v2"
 HEADERS = {
     "Authorization": f"Bearer {TODOIST_TOKEN}",
     "Content-Type": "application/json"
 }
 
-# —— OpenAI client setup —— 
+# —— OpenAI client setup ——
 client = OpenAI(api_key=OPENAI_KEY)
 
-# —— Helpers —— 
+# —— Helpers ——
 def get_unscheduled_tasks():
-    """Fetch all tasks in the project and return those without a due date."""
+    """Fetch tasks with no due date or with a past due date (stale) and return them."""
     resp = requests.get(
         f"{TODOIST_BASE}/tasks",
         headers=HEADERS,
@@ -44,13 +51,17 @@ def get_unscheduled_tasks():
     tasks = resp.json()
     return [
         t for t in tasks
-        if (t.get("due") is None or not t["due"].get("date"))
-        and not t.get("recurring", False)
+        if not t.get("recurring", False)
+        and (
+            t.get("due") is None
+            or not t["due"].get("date")
+            or t["due"]["date"] < today_str
+        )
     ]
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
 def call_openai(messages, functions=None):
-    """Call the OpenAI chat endpoint, nano first, then mini on rate‑limit."""
+    """Call OpenAI: try nano first, fallback to mini if rate limited."""
     try:
         resp = client.chat.completions.create(
             model="gpt-4.1-nano",
@@ -67,6 +78,7 @@ def call_openai(messages, functions=None):
             temperature=0
         )
     return resp.choices[0].message
+
 
 def make_schedule_function():
     return {
@@ -91,6 +103,7 @@ def make_schedule_function():
       }
     }
 
+
 def make_priority_function():
     return {
       "name": "set_priorities",
@@ -114,21 +127,19 @@ def make_priority_function():
       }
     }
 
-# —— 1) Auto‑schedule unscheduled tasks —— 
-now = datetime.now(pytz.timezone(cfg["timezone"]))
-today_str = now.date().isoformat()
-max_date = (now.date() + timedelta(days=cfg["schedule_horizon_days"])).isoformat()
-
+# —— 1) Auto‑schedule unscheduled & stale tasks ——
 unscheduled = get_unscheduled_tasks()
 if unscheduled:
     task_info = [{"id": t["id"], "content": t["content"]} for t in unscheduled]
     messages = [
         {"role": "system", "content": "You are an AI that schedules Todoist tasks."},
-        {"role": "user", "content":
-         f"Today is {today_str}. Here are tasks with no due date:\n{json.dumps(task_info, indent=2)}\n"
-         f"Assign each a 'due_date' between {today_str} and {max_date}, "
-         f"with at most {cfg['max_tasks_per_day']} tasks per day. "
-         "Return a JSON object with key 'tasks', an array of {id, due_date}."}
+        {"role": "user", "content": (
+            f"Today is {today_str}. Here are tasks with no due date or overdue:"
+            f"\n{json.dumps(task_info, indent=2)}\n"
+            f"Assign each a 'due_date' between {today_str} and {max_date}, "
+            f"with at most {cfg['max_tasks_per_day']} tasks per day. "
+            "Return a JSON object with key 'tasks', an array of {id, due_date}."
+        )}
     ]
     fn = make_schedule_function()
     message = call_openai(messages, functions=[fn])
@@ -143,8 +154,7 @@ if unscheduled:
             json={"due_date": item["due_date"]}
         ).raise_for_status()
 
-# —— 2) Auto‑prioritize today’s tasks —— 
-today_iso = today_str
+# —— 2) Auto‑prioritize today’s tasks ——
 resp = requests.get(
     f"{TODOIST_BASE}/tasks",
     headers=HEADERS,
@@ -155,15 +165,16 @@ all_tasks = resp.json()
 todays = [
     {"id": t["id"], "content": t["content"], "due": t["due"]["date"]}
     for t in all_tasks
-    if t.get("due") and t["due"]["date"] <= today_iso
+    if t.get("due") and t["due"]["date"] <= today_str
 ]
 
 if todays:
     messages = [
         {"role": "system", "content": "You are a productivity coach for Todoist."},
-        {"role": "user", "content":
-         f"Rank these tasks by importance for today:\n{json.dumps(todays, indent=2)}\n"
-         "Return a JSON object with key 'tasks', an array of {id, priority}."}
+        {"role": "user", "content": (
+            f"Rank these tasks by importance for today:\n{json.dumps(todays, indent=2)}\n"
+            "Return a JSON object with key 'tasks', an array of {id, priority}."
+        )}
     ]
     fn2 = make_priority_function()
     message2 = call_openai(messages, functions=[fn2])
@@ -179,3 +190,5 @@ if todays:
         ).raise_for_status()
 
 print("✅ Live run complete.")
+```
+
