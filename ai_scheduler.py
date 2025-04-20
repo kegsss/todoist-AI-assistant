@@ -10,25 +10,30 @@ from dotenv import load_dotenv
 import openai
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
-# Calendar integrations have been commented out as per request
-# from google.oauth2 import service_account
-# from googleapiclient.discovery import build
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 from workalendar.america import Canada
 
 # —— Load environment & config ——
 load_dotenv()
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 TODOIST_TOKEN = os.getenv("TODOIST_API_TOKEN")
-# GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
-# GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-if not (OPENAI_KEY and TODOIST_TOKEN):
-    print("⚠️ Missing required env vars: OPENAI_API_KEY, TODOIST_API_TOKEN")
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+if not (OPENAI_KEY and TODOIST_TOKEN and GOOGLE_CALENDAR_ID and GOOGLE_SERVICE_ACCOUNT_JSON):
+    print("⚠️ Missing required env vars: OPENAI_API_KEY, TODOIST_API_TOKEN, GOOGLE_CALENDAR_ID, GOOGLE_SERVICE_ACCOUNT_JSON")
     sys.exit(1)
 
 with open("config.yaml", "r") as f:
     cfg = yaml.safe_load(f)
 
-# —— (Google Calendar client initialization removed) ——
+# —— Initialize Google Calendar client ——
+credentials_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+credentials = service_account.Credentials.from_service_account_info(
+    credentials_info,
+    scopes=["https://www.googleapis.com/auth/calendar"]
+)
+calendar_service = build("calendar", "v3", credentials=credentials)
 
 # —— Work-hour & Holiday settings ——
 cal = Canada()
@@ -130,8 +135,9 @@ def get_unscheduled_tasks():
     ]
 
 unscheduled = get_unscheduled_tasks()
-# map id -> content for logging
+# map id -> content & original priority for logging
 id_to_content = {t["id"]: t["content"] for t in unscheduled}
+id_to_priority = {t["id"]: t["priority"] for t in unscheduled}
 
 if unscheduled:
     fn = make_schedule_function()
@@ -150,16 +156,20 @@ if unscheduled:
     result = json.loads(raw)
     assignments = result.get("tasks", [])
 
-    # sanitize & add content
+    # sanitize & add content + log priority decisions
     sanitized = []
     for item in assignments:
         tid = item.get('id')
+        # log AI vs original priority
+        orig = id_to_priority.get(tid)
+        ai_assigned = item.get('priority')
+        print(f"⚙️ Priority for {tid}: original={orig} → AI_assigned={ai_assigned}")
+
         # ensure due_date
         due = item.get('due_date')
         if not due or due not in date_strs:
             due = date_strs[0]
             print(f"⚠️ Corrected task {tid}: invalid/missing due_date → '{due}'")
-        # ensure not past
         if due < today.isoformat():
             print(f"⚠️ Reassigning overdue date for task {tid}: '{due}' → '{date_strs[0]}'")
             due = date_strs[0]
@@ -168,38 +178,43 @@ if unscheduled:
         if not isinstance(dur, int) or dur < 1:
             dur = cfg.get('default_task_duration_minutes', 60)
             print(f"⚠️ Corrected task {tid}: invalid/missing duration_minutes → {dur}")
-        # attach content and priority
+        # attach content
+        content = id_to_content.get(tid, 'Task')
         sanitized.append({
             'id': tid,
-            'priority': item.get('priority', 4),
+            'priority': ai_assigned,
             'due_date': due,
             'duration_minutes': dur,
-            'content': id_to_content.get(tid, 'Task')
+            'content': content
         })
 
     # schedule without overlaps
-    day_slots = {d: datetime.combine(d, work_start) for d in avail_dates}
+    day_slots = {d: tz.localize(datetime.combine(d, work_start)) for d in avail_dates}
 
     for item in sorted(sanitized, key=lambda x: (x['due_date'], x['priority'])):
         due = date.fromisoformat(item['due_date'])
-        start_dt_naive = day_slots[due]
-        start_dt = tz.localize(start_dt_naive)
+        start_dt = day_slots[due]
         dur = item['duration_minutes']
         end_dt = start_dt + timedelta(minutes=dur)
         work_end_dt = tz.localize(datetime.combine(due, work_end))
         if end_dt > work_end_dt:
             end_dt = work_end_dt
-        # log including priority, date, time, and duration
-        print(f"🗓 Scheduling {item['id']} ('{item['content']}') priority={item['priority']} "
-              f"on {due} from {start_dt.time()} to {end_dt.time()} ({dur} min)")
+        # log scheduling
+        print(f"🗓 Scheduling {item['id']} ('{item['content']}') priority={item['priority']} on {due} from {start_dt.time()} to {end_dt.time()} ({dur} min)")
+
         # update Todoist
         requests.post(
             f"{TODOIST_BASE}/tasks/{item['id']}",
             headers=HEADERS,
-            json={"due_date": item['due_date']}
+            json={"due_date": item['due_date']} 
         ).raise_for_status()
-        # advance slot
-        day_slots[due] = end_dt.replace(tzinfo=None)
+        # create calendar event
+        event = {
+            "summary": item['content'],
+            "start": {"dateTime": start_dt.isoformat(), "timeZone": cfg['timezone']},
+            "end": {"dateTime": end_dt.isoformat(), "timeZone": cfg['timezone']},
+        }
+        calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
 
 # —— 2) Auto-prioritize today’s tasks ——
 resp = requests.get(
@@ -231,9 +246,8 @@ if tasks_today:
     msg2 = call_openai(messages2, functions=[fn2])
     ranks = json.loads(msg2.function_call.arguments).get("tasks", [])
     for r in ranks:
-        print(f"🔧 Setting priority for {r['id']} → {r['priority']}")
         requests.post(
-            f"{TODOIST_BASE}/tasks/{r['id']}", headers=HEADERS, json={"priority": r['priority']}
+            f"{TODOIST_BASE}/tasks/{r['id']}", headers=HEADERS, json={"priority": r['priority']}        
         ).raise_for_status()
 
 print("✅ Scheduler run complete.")
