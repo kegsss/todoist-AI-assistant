@@ -1,10 +1,12 @@
-openai>=1.0.0
-requests
+fastapi
+uvicorn[standard]
 python-dotenv
-todoist-api-python
+requests
+openai
 pytz
-workalendar
-tenacity
 PyYAML
+workalendar
 google-api-python-client
 google-auth
+todoist-api-python
+tenacity
