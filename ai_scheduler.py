@@ -164,14 +164,20 @@ unscheduled = get_unscheduled_tasks()
 if unscheduled:
     fn = make_schedule_function()
     messages = [
-        {"role": "system", "content": "You are an AI scheduling tasks in Todoist."},
+        {"role": "system", "content": "You are an AI scheduling tasks in Todoist. Use only the provided work dates and assign every task a due_date."},
         {"role": "user", "content": (
-            f"Available work dates: {date_strs}\n"
-            f"Here are tasks (with priority) to schedule:\n{json.dumps(unscheduled, indent=2)}\n"
-            f"Assign each a due_date from these dates, with at most {cfg['max_tasks_per_day']} tasks per day. Return a JSON object with key 'tasks', an array of {{id, priority, due_date}}."
+            f"Available work dates: {date_strs}
+"
+            f"Here are tasks (with priority) to schedule:
+{json.dumps(unscheduled, indent=2)}
+"
+            f"Assign each a due_date from these dates, with at most {cfg['max_tasks_per_day']} tasks per day, and ensure every task gets a due_date. "
+            "Return a JSON object with key 'tasks', an array of {id, priority, due_date}."
         )}
     ]
     message = call_openai(messages, functions=[fn])
+    # debug log raw AI response
+    print("📝 Raw AI assignments:", message.function_call.arguments)
     result = json.loads(message.function_call.arguments)
     assignments = result.get("tasks", [])
 
