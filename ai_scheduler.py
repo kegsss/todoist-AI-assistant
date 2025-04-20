@@ -2,7 +2,7 @@
 import os
 import sys
 import json
-import yaml
+yaml
 import pytz
 import requests
 from datetime import datetime, timedelta, date
@@ -124,7 +124,12 @@ def get_unscheduled_tasks():
     resp.raise_for_status()
     tasks = resp.json()
     return [
-        {"id": t["id"], "content": t["content"], "priority": t.get("priority", 4)}
+        {
+            "id": t["id"],
+            "content": t["content"],
+            "priority": t.get("priority", 4),
+            "created_at": t.get("created_at")
+        }
         for t in tasks
         if not t.get("recurring", False)
         and (
@@ -134,10 +139,25 @@ def get_unscheduled_tasks():
         )
     ]
 
+# buffer & decay settings
+BUFFER_MIN = cfg.get('buffer_minutes', 5)               # minutes between tasks
+DECAY_PER_DAY = cfg.get('priority_decay_per_day', 1)     # priority levels per full day since creation
+
 unscheduled = get_unscheduled_tasks()
-# map id -> content & original priority for logging
+# apply priority decay
+for task in unscheduled:
+    orig = task['priority']
+    created = task.get('created_at')
+    if created:
+        created_date = date.fromisoformat(created[:10])
+        days_old = (today - created_date).days
+        decay = days_old * DECAY_PER_DAY
+        new_prio = max(1, orig - decay)
+        if new_prio != orig:
+            print(f"⚠️ Priority decay: task {task['id']} created on {created_date} orig_prio={orig} → decayed_prio={new_prio}")
+            task['priority'] = new_prio
+
 id_to_content = {t["id"]: t["content"] for t in unscheduled}
-id_to_priority = {t["id"]: t["priority"] for t in unscheduled}
 
 if unscheduled:
     fn = make_schedule_function()
@@ -146,7 +166,7 @@ if unscheduled:
         {"role": "user",
          "content": (
              f"Available dates: {date_strs}\n"
-             f"Tasks (id, priority): {json.dumps(unscheduled, indent=2)}\n"
+             f"Tasks (id, priority): {json.dumps([{ 'id':t['id'], 'priority':t['priority']} for t in unscheduled], indent=2)}\n"
              f"Max {cfg['max_tasks_per_day']} tasks per date. Return JSON with 'tasks': [{{id, priority, due_date, duration_minutes}}]."
          )}
     ]
@@ -156,16 +176,10 @@ if unscheduled:
     result = json.loads(raw)
     assignments = result.get("tasks", [])
 
-    # sanitize & add content + log priority decisions
+    # sanitize & attach content
     sanitized = []
     for item in assignments:
         tid = item.get('id')
-        # log AI vs original priority
-        orig = id_to_priority.get(tid)
-        ai_assigned = item.get('priority')
-        print(f"⚙️ Priority for {tid}: original={orig} → AI_assigned={ai_assigned}")
-
-        # ensure due_date
         due = item.get('due_date')
         if not due or due not in date_strs:
             due = date_strs[0]
@@ -173,48 +187,46 @@ if unscheduled:
         if due < today.isoformat():
             print(f"⚠️ Reassigning overdue date for task {tid}: '{due}' → '{date_strs[0]}'")
             due = date_strs[0]
-        # ensure duration
         dur = item.get('duration_minutes')
         if not isinstance(dur, int) or dur < 1:
             dur = cfg.get('default_task_duration_minutes', 60)
             print(f"⚠️ Corrected task {tid}: invalid/missing duration_minutes → {dur}")
-        # attach content
-        content = id_to_content.get(tid, 'Task')
         sanitized.append({
-            'id': tid,
-            'priority': ai_assigned,
-            'due_date': due,
+            'id':         tid,
+            'priority':   item.get('priority', 4),
+            'due_date':   due,
             'duration_minutes': dur,
-            'content': content
+            'content':    id_to_content.get(tid, 'Task')
         })
 
-    # schedule without overlaps
-    day_slots = {d: tz.localize(datetime.combine(d, work_start)) for d in avail_dates}
-
+    # schedule with buffer, no overlaps
+    day_slots = {d: datetime.combine(d, work_start) for d in avail_dates}
     for item in sorted(sanitized, key=lambda x: (x['due_date'], x['priority'])):
         due = date.fromisoformat(item['due_date'])
-        start_dt = day_slots[due]
+        start_naive = day_slots[due]
+        start_dt = tz.localize(start_naive)
         dur = item['duration_minutes']
         end_dt = start_dt + timedelta(minutes=dur)
         work_end_dt = tz.localize(datetime.combine(due, work_end))
         if end_dt > work_end_dt:
             end_dt = work_end_dt
-        # log scheduling
-        print(f"🗓 Scheduling {item['id']} ('{item['content']}') priority={item['priority']} on {due} from {start_dt.time()} to {end_dt.time()} ({dur} min)")
-
+        print(f"🗓 Scheduling {item['id']} ('{item['content']}') priority={item['priority']} on {due} from {start_dt.time()} to {end_dt.time()} for {dur} min, buffer={BUFFER_MIN} min")
         # update Todoist
         requests.post(
             f"{TODOIST_BASE}/tasks/{item['id']}",
             headers=HEADERS,
-            json={"due_date": item['due_date']} 
+            json={"due_date": item['due_date']}
         ).raise_for_status()
         # create calendar event
         event = {
             "summary": item['content'],
-            "start": {"dateTime": start_dt.isoformat(), "timeZone": cfg['timezone']},
-            "end": {"dateTime": end_dt.isoformat(), "timeZone": cfg['timezone']},
+            "start":   {"dateTime": start_dt.isoformat(), "timeZone": cfg['timezone']},
+            "end":     {"dateTime": end_dt.isoformat(),   "timeZone": cfg['timezone']},
         }
         calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
+        # advance slot with buffer
+        next_slot = end_dt + timedelta(minutes=BUFFER_MIN)
+        day_slots[due] = next_slot.replace(tzinfo=None)
 
 # —— 2) Auto-prioritize today’s tasks ——
 resp = requests.get(
@@ -246,8 +258,9 @@ if tasks_today:
     msg2 = call_openai(messages2, functions=[fn2])
     ranks = json.loads(msg2.function_call.arguments).get("tasks", [])
     for r in ranks:
+        print(f"🏷 Setting priority {r['priority']} for task {r['id']}")
         requests.post(
-            f"{TODOIST_BASE}/tasks/{r['id']}", headers=HEADERS, json={"priority": r['priority']}        
+            f"{TODOIST_BASE}/tasks/{r['id']}", headers=HEADERS, json={"priority": r['priority']}
         ).raise_for_status()
 
 print("✅ Scheduler run complete.")
