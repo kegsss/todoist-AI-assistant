@@ -21,7 +21,7 @@ TODOIST_TOKEN = os.getenv("TODOIST_API_TOKEN")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 if not (OPENAI_KEY and TODOIST_TOKEN and GOOGLE_CALENDAR_ID and GOOGLE_SERVICE_ACCOUNT_JSON):
-    print("⚠️  Missing one of the required env vars: OPENAI_API_KEY, TODOIST_API_TOKEN, GOOGLE_CALENDAR_ID, GOOGLE_SERVICE_ACCOUNT_JSON")
+    print("⚠️ Missing required env vars: OPENAI_API_KEY, TODOIST_API_TOKEN, GOOGLE_CALENDAR_ID, GOOGLE_SERVICE_ACCOUNT_JSON")
     sys.exit(1)
 
 with open("config.yaml", "r") as f:
@@ -39,14 +39,11 @@ calendar_service = build("calendar", "v3", credentials=credentials)
 cal = Canada()
 tz = pytz.timezone(cfg["timezone"])
 work_start = datetime.strptime(cfg["work_hours"]["start"], "%H:%M").time()
-work_end   = datetime.strptime(cfg["work_hours"]["end"],   "%H:%M").time()
+work_end = datetime.strptime(cfg["work_hours"]["end"], "%H:%M").time()
 
 # —— Todoist API settings ——
 TODOIST_BASE = "https://api.todoist.com/rest/v2"
-HEADERS = {
-    "Authorization": f"Bearer {TODOIST_TOKEN}",
-    "Content-Type": "application/json"
-}
+HEADERS = {"Authorization": f"Bearer {TODOIST_TOKEN}", "Content-Type": "application/json"}
 
 # —— OpenAI client setup ——
 client = OpenAI(api_key=OPENAI_KEY)
@@ -162,16 +159,18 @@ unscheduled = get_unscheduled_tasks()
 if unscheduled:
     fn = make_schedule_function()
     messages = [
-        {"role": "system", "content": "You are an AI scheduling tasks in Todoist. Use only the provided work dates and assign every task a due_date."},
-        {"role": "user", "content": (
-            f"Available work dates: {date_strs}\n"
-            f"Here are tasks (with priority) to schedule:\n{json.dumps(unscheduled, indent=2)}\n"
-            f"Assign each a due_date from these dates, with at most {cfg['max_tasks_per_day']} tasks per day. Under no circumstances should any due_date be empty; if you cannot determine a better date, assign the earliest available work date."
-            " Return a JSON object with key 'tasks', an array of objects each containing id, priority, and due_date."
-        )}}
+        {"role": "system", "content": "You are an AI scheduling tasks in Todoist. Use only the provided work dates and ensure every task gets a due_date."},
+        {
+            "role": "user",
+            "content": (
+                f"Available work dates: {date_strs}\n"
+                f"Here are tasks (with priority) to schedule:\n{json.dumps(unscheduled, indent=2)}\n"
+                f"Assign each a due_date from these dates, with at most {cfg['max_tasks_per_day']} tasks per day. Under no circumstances should due_date be empty; if unsure, assign the earliest available date. "
+                "Return a JSON object with key 'tasks', an array of {id, priority, due_date}."
+            )
+        }
     ]
     message = call_openai(messages, functions=[fn])
-    # debug log raw AI response
     print("📝 Raw AI assignments:", message.function_call.arguments)
     result = json.loads(message.function_call.arguments)
     assignments = result.get("tasks", [])
@@ -186,24 +185,19 @@ if unscheduled:
         except ValueError:
             print(f"⚠️ Skipping task {item.get('id')} with invalid due_date '{due_str}'")
             continue
-        # Update Todoist
         requests.post(
             f"{TODOIST_BASE}/tasks/{item['id']}",
             headers=HEADERS,
             json={"due_date": due_str}
         ).raise_for_status()
-        # Create Calendar event
         start_dt = tz.localize(datetime.combine(due, work_start))
-        end_dt   = tz.localize(datetime.combine(due, work_end))
+        end_dt = tz.localize(datetime.combine(due, work_end))
         event = {
             "summary": item.get("content", "Task"),
             "start": {"dateTime": start_dt.isoformat(), "timeZone": cfg['timezone']},
-            "end":   {"dateTime": end_dt.isoformat(),   "timeZone": cfg['timezone']},
+            "end": {"dateTime": end_dt.isoformat(), "timeZone": cfg['timezone']},
         }
-        calendar_service.events().insert(
-            calendarId=GOOGLE_CALENDAR_ID,
-            body=event
-        ).execute()
+        calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
 
 # —— 2) Auto-prioritize today’s tasks ——
 resp = requests.get(
@@ -212,6 +206,7 @@ resp = requests.get(
     params={"project_id": cfg["project_id"]}
 )
 resp.raise_for_status()
+
 tasks_today = [
     {"id": t["id"], "content": t["content"], "due": t["due"]["date"]}
     for t in resp.json()
@@ -222,18 +217,19 @@ if tasks_today:
     fn2 = make_priority_function()
     messages = [
         {"role": "system", "content": "You are a productivity coach for Todoist."},
-        {"role": "user", "content": (
-            f"Rank these tasks by importance for today:\n{json.dumps(tasks_today, indent=2)}\n"
-            "Return a JSON object with key 'tasks', an array of {id, priority}."
-        )}
+        {
+            "role": "user",
+            "content": (
+                f"Rank these tasks by importance for today:\n{json.dumps(tasks_today, indent=2)}\n"
+                "Return a JSON object with key 'tasks', an array of {id, priority}."
+            )
+        }
     ]
     message2 = call_openai(messages, functions=[fn2])
     ranks = json.loads(message2.function_call.arguments).get("tasks", [])
     for r in ranks:
         requests.post(
-            f"{TODOIST_BASE}/tasks/{r['id']}",
-            headers=HEADERS,
-            json={"priority": r['priority']}
+            f"{TODOIST_BASE}/tasks/{r['id']}", headers=HEADERS, json={"priority": r['priority']}
         ).raise_for_status()
 
 print("✅ Scheduler run complete.")
