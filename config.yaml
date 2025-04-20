@@ -1,5 +1,9 @@
-project_id: 2352479983         # ← replace with your actual Todoist project ID
-max_tasks_per_day: 10
-schedule_horizon_days: 7
-timezone: America/Toronto
-run_hour: 5
+project_id: 2352479983        # your Todoist project
+max_tasks_per_day: 10         # cap how many new tasks per day
+schedule_horizon_days: 7      # look this many days ahead
+
+timezone: America/Toronto     # your IANA timezone
+
+work_hours:                   # only schedule within these hours
+  start: "09:00"
+  end:   "17:00"
