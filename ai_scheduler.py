@@ -191,11 +191,11 @@ if unscheduled:
             dur = cfg.get('default_task_duration_minutes', 60)
             print(f"⚠️ Corrected task {tid}: invalid/missing duration_minutes → {dur}")
         sanitized.append({
-            'id':             tid,
-            'priority':       item.get('priority', 4),
-            'due_date':       due,
+            'id':               tid,
+            'priority':         item.get('priority', 4),
+            'due_date':         due,
             'duration_minutes': dur,
-            'content':        id_to_content.get(tid, 'Task')
+            'content':          id_to_content.get(tid, 'Task')
         })
 
     # schedule with buffer, no overlaps
@@ -248,5 +248,17 @@ if tasks_today:
         "parameters": {"type": "object", "properties": {"tasks": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "priority": {"type": "integer", "minimum":1, "maximum":4}}, "required":["id","priority"]}}}, "required":["tasks"]}
     }
     messages2 = [
-        {"role": "system",
+        {"role": "system", "content": "You are a productivity coach for Todoist."},
+        {"role": "user", "content": (
+            f"Rank these tasks by importance for today:\n{json.dumps(tasks_today, indent=2)}\n"
+            "Return JSON with 'tasks': [{id, priority}]."
+        )}
+    ]
+    msg2 = call_openai(messages2, functions=[fn2])
+    ranks = json.loads(msg2.function_call.arguments).get("tasks", [])
+    for r in ranks:
+        requests.post(
+            f"{TODOIST_BASE}/tasks/{r['id']}", headers=HEADERS, json={"priority": r['priority']}
+        ).raise_for_status()
 
+print("✅ Scheduler run complete.")
