@@ -1,12 +1,20 @@
-fastapi
-uvicorn[standard]
-python-dotenv
-requests
-openai
-pytz
-PyYAML
-workalendar
-google-api-python-client
-google-auth
-todoist-api-python
-tenacity
+# HTTP + env
+requests>=2.32.3
+python-dotenv>=1.1.0
+
+# Scheduling & AI
+openai>=1.75.0
+todoist-api-python>=3.0.1
+PyYAML>=6.0.2
+pytz>=2025.2
+workalendar>=17.0.0
+tenacity>=9.1.2
+
+# Google Calendar
+google-api-python-client>=2.167.0
+google-auth>=2.39.0
+google-auth-httplib2>=0.2.0
+
+# Webhook server
+fastapi>=0.95.0
+uvicorn[standard]>=0.22.0
