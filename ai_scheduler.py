@@ -48,19 +48,7 @@ HEADERS = {"Authorization": f"Bearer {TODOIST_TOKEN}", "Content-Type": "applicat
 # —— OpenAI client setup ——
 client = OpenAI(api_key=OPENAI_KEY)
 
-# —— Helpers ——
-def is_working_day(d: date) -> bool:
-    return d.weekday() < 5 and cal.is_working_day(d)
-
-def get_available_dates(start: date, end: date) -> list[date]:
-    days = []
-    curr = start
-    while curr <= end:
-        if is_working_day(curr):
-            days.append(curr)
-        curr += timedelta(days=1)
-    return days
-
+# —— Call wrapper with retry & fallback ——
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
 def call_openai(messages, functions=None):
     try:
@@ -80,7 +68,7 @@ def call_openai(messages, functions=None):
         )
     return resp.choices[0].message
 
-# —— Schema definitions ——
+# —— Function schemas ——
 def make_schedule_function():
     return {
         "name": "assign_due_dates",
@@ -94,10 +82,9 @@ def make_schedule_function():
                         "type": "object",
                         "properties": {
                             "id": {"type": "string"},
-                            "priority": {"type": "integer", "minimum": 1, "maximum": 4},
-                            "due_date": {"type": "string", "format": "date"}
+                            "priority": {"type": "integer", "minimum": 1, "maximum": 4}
                         },
-                        "required": ["id", "priority"]  # due_date optional input
+                        "required": ["id", "priority"]
                     }
                 }
             },
@@ -128,7 +115,20 @@ def make_priority_function():
         }
     }
 
-# —— Compute date ranges ——
+# —— Helpers ——
+def is_working_day(d: date) -> bool:
+    return d.weekday() < 5 and cal.is_working_day(d)
+
+def get_available_dates(start: date, end: date) -> list[date]:
+    days = []
+    curr = start
+    while curr <= end:
+        if is_working_day(curr):
+            days.append(curr)
+        curr += timedelta(days=1)
+    return days
+
+# —— Date range setup ——
 now = datetime.now(tz)
 today = now.date()
 max_date = today + timedelta(days=cfg["schedule_horizon_days"])
@@ -145,38 +145,31 @@ def get_unscheduled_tasks():
     )
     resp.raise_for_status()
     tasks = resp.json()
-    return [
-        {"id": t["id"], "content": t["content"], "priority": t.get("priority", 4)}
-        for t in tasks
-        if not t.get("recurring", False)
-        and (
-            t.get("due") is None
-            or not t["due"].get("date")
-            or t["due"]["date"] < today.isoformat()
-        )
-    ]
+    uns = []
+    for t in tasks:
+        if t.get("recurring", False):
+            continue
+        due = t.get("due", {}).get("date")
+        if due is None or due < today.isoformat():
+            uns.append({"id": t["id"], "content": t["content"], "priority": t.get("priority", 4)})
+    return uns
 
 unscheduled = get_unscheduled_tasks()
 if unscheduled:
     fn = make_schedule_function()
     messages = [
-        {"role": "system", "content": "You are an AI scheduling tasks in Todoist. Use only the provided work dates and ensure every task gets a due_date."},
-        {
-            "role": "user",
-            "content": (
-                f"Available work dates: {date_strs}\n"
-                f"Here are tasks (with priority) to schedule:\n{json.dumps(unscheduled, indent=2)}\n"
-                f"Assign each a due_date from these dates, with at most {cfg['max_tasks_per_day']} tasks per day. Under no circumstances should due_date be empty; if unsure, assign the earliest available date."
-            )
-        }
+        {"role": "system", "content": "You are an AI scheduling tasks in Todoist. Use only the provided work dates and schedule every task."},
+        {"role": "user", "content": (
+            f"Available work dates: {date_strs}\n"
+            f"Tasks to schedule with priority:\n{json.dumps(unscheduled, indent=2)}\n"
+            f"Assign each a due_date. At most {cfg['max_tasks_per_day']} per day. Return JSON with 'tasks':[{{id,priority,due_date}}]."
+        )}
     ]
     message = call_openai(messages, functions=[fn])
     print("📝 Raw AI assignments:", message.function_call.arguments)
     result = json.loads(message.function_call.arguments)
-    assignments = result.get("tasks", [])
-
-    for item in assignments:
-        due_str = item.get('due_date', '')
+    for item in result.get("tasks", []):
+        due_str = item.get("due_date", "")
         if not due_str:
             print(f"⚠️ Skipping task {item.get('id')} with empty due_date")
             continue
@@ -199,7 +192,7 @@ if unscheduled:
         }
         calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
 
-# —— 2) Auto-prioritize today’s tasks ——
+# —— 2) Auto-prioritize today's tasks ——
 resp = requests.get(
     f"{TODOIST_BASE}/tasks",
     headers=HEADERS,
@@ -216,20 +209,17 @@ tasks_today = [
 if tasks_today:
     fn2 = make_priority_function()
     messages = [
-        {"role": "system", "content": "You are a productivity coach for Todoist."},
-        {
-            "role": "user",
-            "content": (
-                f"Rank these tasks by importance for today:\n{json.dumps(tasks_today, indent=2)}\n"
-                "Return a JSON object with key 'tasks', an array of {id, priority}."
-            )
-        }
+        {"role": "system", "content": "You are a productivity coach."},
+        {"role": "user", "content": (
+            f"Rank these tasks by importance for today:\n{json.dumps(tasks_today, indent=2)}\n"
+            "Return JSON with 'tasks':[{'id','priority'}]."
+        )}
     ]
     message2 = call_openai(messages, functions=[fn2])
-    ranks = json.loads(message2.function_call.arguments).get("tasks", [])
-    for r in ranks:
+    for r in json.loads(message2.function_call.arguments).get("tasks", []):
         requests.post(
-            f"{TODOIST_BASE}/tasks/{r['id']}", headers=HEADERS, json={"priority": r['priority']}
+            f"{TODOIST_BASE}/tasks/{r['id']}", headers=HEADERS,
+            json={"priority": r['priority']}
         ).raise_for_status()
 
 print("✅ Scheduler run complete.")
