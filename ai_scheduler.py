@@ -133,6 +133,8 @@ now = datetime.now(tz)
 today = now.date()
 max_date = today + timedelta(days=cfg["schedule_horizon_days"])
 avail_dates = get_available_dates(today, max_date)
+# DEBUG: print out available work dates to verify on weekends/holidays
+print(f"🔍 Available work dates between {today.isoformat()} and {max_date.isoformat()}: {[d.isoformat() for d in avail_dates]}")
 date_strs = [d.isoformat() for d in avail_dates]
 
 # —— 1) Auto-schedule unscheduled & overdue tasks ——
