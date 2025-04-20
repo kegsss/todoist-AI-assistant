@@ -7,7 +7,6 @@ import pytz
 import requests
 from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
-import openai
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 from google.oauth2 import service_account
@@ -53,13 +52,13 @@ def is_working_day(d: date) -> bool:
     return d.weekday() < 5 and cal.is_working_day(d)
 
 def get_available_dates(start: date, end: date) -> list[date]:
-    days = []
+    dates = []
     curr = start
     while curr <= end:
         if is_working_day(curr):
-            days.append(curr)
+            dates.append(curr)
         curr += timedelta(days=1)
-    return days
+    return dates
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
 def call_openai(messages, functions=None):
@@ -84,7 +83,7 @@ def call_openai(messages, functions=None):
 def make_schedule_function():
     return {
         "name": "assign_due_dates",
-        "description": "Assign due dates for tasks within available work days, favoring higher priorities.",
+        "description": "Assign due dates for tasks within available work days, favoring higher priorities. Every task must include a due_date.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -97,7 +96,7 @@ def make_schedule_function():
                             "priority": {"type": "integer", "minimum": 1, "maximum": 4},
                             "due_date": {"type": "string", "format": "date"}
                         },
-                        "required": ["id", "priority"]
+                        "required": ["id", "priority", "due_date"]
                     }
                 }
             },
@@ -133,7 +132,6 @@ now = datetime.now(tz)
 today = now.date()
 max_date = today + timedelta(days=cfg["schedule_horizon_days"])
 avail_dates = get_available_dates(today, max_date)
-# DEBUG: print out available work dates
 print(f"🔍 Available work dates between {today.isoformat()} and {max_date.isoformat()}: {[d.isoformat() for d in avail_dates]}")
 date_strs = [d.isoformat() for d in avail_dates]
 
@@ -148,17 +146,12 @@ def get_unscheduled_tasks():
     tasks = resp.json()
     unscheduled = []
     for t in tasks:
-        # skip recurring
         if t.get("recurring", False):
             continue
-        due_info = t.get("due")
-        due_date_str = None
-        if isinstance(due_info, dict):
-            due_date_str = due_info.get("date")
-        # unscheduled or overdue
-        if not due_date_str or due_date_str < today.isoformat():
+        due = (t.get("due") or {}).get("date")
+        if not due or due < today.isoformat():
             unscheduled.append({
-                "id": str(t["id"]),
+                "id": t["id"],
                 "content": t.get("content", ""),
                 "priority": t.get("priority", 4)
             })
@@ -169,38 +162,40 @@ if unscheduled:
     fn = make_schedule_function()
     messages = [
         {"role": "system", "content": "You are an AI scheduling tasks in Todoist. Use only the provided work dates and ensure every task gets a due_date."},
-        {"role": "user",
-         "content": (
-             f"Available work dates: {date_strs}\n"
-             f"Here are tasks (with priority) to schedule:\n{json.dumps(unscheduled, indent=2)}\n"
-             f"Assign each a due_date from these dates, with at most {cfg['max_tasks_per_day']} tasks per day. "
-             "Under no circumstances should due_date be empty; if unsure, assign the earliest available date. "
-             "Return a JSON object with key 'tasks', an array of {id, priority, due_date}."
-         )
-        }
+        {"role": "user", "content": (
+            f"Available work dates: {date_strs}\n"
+            f"Here are tasks (with priority) to schedule:\n{json.dumps(unscheduled, indent=2)}\n"
+            f"Assign each a due_date from these dates, with at most {cfg['max_tasks_per_day']} tasks per day. "
+            "Every task MUST include a non-empty due_date. Do not omit due_date under any circumstance. "
+            "Return a JSON object with key 'tasks', an array of {id, priority, due_date}."
+        )}
     ]
     message = call_openai(messages, functions=[fn])
-    print("📝 Raw AI assignments:", message.function_call.arguments)
-    result = json.loads(message.function_call.arguments)
+    raw = message.function_call.arguments
+    print("📝 Raw AI assignments:", raw)
+    result = json.loads(raw)
     assignments = result.get("tasks", [])
 
+    # Verify due_date presence
+    missing = [a for a in assignments if not a.get("due_date")]
+    if missing:
+        print(f"⚠️ AI returned tasks without due_date for IDs: {[a['id'] for a in missing]}")
+        sys.exit(1)
+
     for item in assignments:
-        due_str = item.get('due_date', '')
-        if not due_str:
-            print(f"⚠️ Skipping task {item.get('id')} with empty due_date")
-            continue
+        due_str = item['due_date']
         try:
             due = date.fromisoformat(due_str)
-        except ValueError:
-            print(f"⚠️ Skipping task {item.get('id')} with invalid due_date '{due_str}'")
+        except Exception:
+            print(f"⚠️ Skipping task {item['id']} with invalid due_date '{due_str}'")
             continue
-        # update Todoist
+        # Update Todoist
         requests.post(
             f"{TODOIST_BASE}/tasks/{item['id']}",
             headers=HEADERS,
             json={"due_date": due_str}
         ).raise_for_status()
-        # add to calendar
+        # Insert calendar event
         start_dt = tz.localize(datetime.combine(due, work_start))
         end_dt = tz.localize(datetime.combine(due, work_end))
         event = {
@@ -219,21 +214,19 @@ resp = requests.get(
 resp.raise_for_status()
 
 tasks_today = [
-    {"id": str(t["id"]), "content": t.get("content", ""), "due": t.get("due", {}).get("date")}  
+    {"id": t["id"], "content": t.get("content",""), "due": t.get("due",{}).get("date")}  
     for t in resp.json()
-    if t.get("due") and t["due"].get("date") and t["due"]["date"] <= today.isoformat()
+    if t.get("due") and t["due"].get("date") <= today.isoformat()
 ]
 
 if tasks_today:
     fn2 = make_priority_function()
     messages = [
         {"role": "system", "content": "You are a productivity coach for Todoist."},
-        {"role": "user",
-         "content": (
-             f"Rank these tasks by importance for today:\n{json.dumps(tasks_today, indent=2)}\n"
-             "Return a JSON object with key 'tasks', an array of {id, priority}."
-         )
-        }
+        {"role": "user", "content": (
+            f"Rank these tasks by importance for today:\n{json.dumps(tasks_today, indent=2)}\n"
+            "Return a JSON object with key 'tasks', an array of {id, priority}."
+        )}
     ]
     message2 = call_openai(messages, functions=[fn2])
     ranks = json.loads(message2.function_call.arguments).get("tasks", [])
