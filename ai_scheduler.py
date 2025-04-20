@@ -53,9 +53,7 @@ client = OpenAI(api_key=OPENAI_KEY)
 
 # —— Helpers ——
 def is_working_day(d: date) -> bool:
-    if d.weekday() >= 5:
-        return False
-    return cal.is_working_day(d)
+    return d.weekday() < 5 and cal.is_working_day(d)
 
 def get_available_dates(start: date, end: date) -> list[date]:
     days = []
@@ -169,8 +167,8 @@ if unscheduled:
         {"role": "user", "content": (
             f"Available work dates: {date_strs}\n"
             f"Here are tasks (with priority) to schedule:\n{json.dumps(unscheduled, indent=2)}\n"
-            "Assign each a due_date *from* these dates, with at most "
-            f"{cfg['max_tasks_per_day']} tasks per day. Return JSON {tasks:[{id,priority,due_date}]}."
+            f"Assign each a due_date from these dates, with at most {cfg['max_tasks_per_day']} tasks per day. "
+            "Return a JSON object with key 'tasks', an array of {id, priority, due_date}."
         )}
     ]
     message = call_openai(messages, functions=[fn])
@@ -217,7 +215,7 @@ if tasks_today:
         {"role": "system", "content": "You are a productivity coach for Todoist."},
         {"role": "user", "content": (
             f"Rank these tasks by importance for today:\n{json.dumps(tasks_today, indent=2)}\n"
-            "Return JSON {tasks:[{id,priority}]}."
+            "Return a JSON object with key 'tasks', an array of {id, priority}."
         )}
     ]
     message2 = call_openai(messages, functions=[fn2])
