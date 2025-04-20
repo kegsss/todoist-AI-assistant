@@ -5,7 +5,7 @@ import json
 import yaml
 import pytz
 import requests
-from datetime import datetime, timedelta, date, time
+from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
 import openai
 from openai import OpenAI
@@ -74,7 +74,6 @@ def call_openai(messages, functions=None):
             temperature=0
         )
     except Exception as e:
-        # Fallback to mini on rate limit or other errors
         print(f"⚠️ OpenAI error: {e}. Falling back to gpt-4.1-mini…")
         resp = client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -108,7 +107,6 @@ def make_schedule_function():
             "required": ["tasks"]
         }
     }
-
 
 def make_priority_function():
     return {
@@ -166,11 +164,8 @@ if unscheduled:
     messages = [
         {"role": "system", "content": "You are an AI scheduling tasks in Todoist. Use only the provided work dates and assign every task a due_date."},
         {"role": "user", "content": (
-            f"Available work dates: {date_strs}
-"
-            f"Here are tasks (with priority) to schedule:
-{json.dumps(unscheduled, indent=2)}
-"
+            f"Available work dates: {date_strs}\n"
+            f"Here are tasks (with priority) to schedule:\n{json.dumps(unscheduled, indent=2)}\n"
             f"Assign each a due_date from these dates, with at most {cfg['max_tasks_per_day']} tasks per day, and ensure every task gets a due_date. "
             "Return a JSON object with key 'tasks', an array of {id, priority, due_date}."
         )}
@@ -229,7 +224,7 @@ if tasks_today:
         {"role": "system", "content": "You are a productivity coach for Todoist."},
         {"role": "user", "content": (
             f"Rank these tasks by importance for today:\n{json.dumps(tasks_today, indent=2)}\n"
-            "Return a JSON object with key 'tasks', an array of {{id, priority}}."
+            "Return a JSON object with key 'tasks', an array of {id, priority}."
         )}
     ]
     message2 = call_openai(messages, functions=[fn2])
