@@ -17,8 +17,8 @@ RUN pip install --upgrade pip \
 # Copy the rest of the codebase
 COPY . .
 
-# Expose the port FastAPI will run on
+# Expose the port FastAPI will run on. expose is optional on Render, but harmless
 EXPOSE 8000
 
-# Default command to launch the FastAPI app
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# shell form so $PORT is expanded
+CMD uvicorn app:app --host 0.0.0.0 --port $PORT

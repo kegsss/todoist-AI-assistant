@@ -1,35 +1,53 @@
-# app.py  (or rename to main.py)
+# app.py
+
 import os
 import subprocess
-
 from fastapi import FastAPI, Request, HTTPException
-from starlette.responses import PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 
 app = FastAPI()
 
-# If you have any module‑level setup (env vars, logging, etc),
-# you can do it here or import from your ai_scheduler module.
+# —— Health check endpoint ——
+@app.get("/healthz")
+def healthz():
+    """
+    Simple health check endpoint for Render (or any other
+    load‑balancer) to verify the service is up.
+    """
+    return JSONResponse({"status": "ok"})
 
+
+# —— Todoist webhook receiver ——
 @app.post("/webhook")
 async def todoist_webhook(req: Request):
     """
     Endpoint that Todoist will POST to when something changes.
-    We fire off a non‑blocking scheduler run.
+    We fire off ai_scheduler.py in the background so it can
+    immediately pick up any new or modified tasks.
     """
     payload = await req.json()
-    # TODO: verify signature / payload if you like
-
-    # Kick off ai_scheduler in the background
+    # TODO: verify webhook signature / payload if desired
+    # Kick off the scheduler asynchronously
     subprocess.Popen(["python", "ai_scheduler.py"])
     return PlainTextResponse("OK", status_code=200)
 
+
+# —— Manual trigger endpoint ——
 @app.get("/run")
 def run_scheduler():
     """
     Manual trigger: run the scheduler synchronously and return status.
+    Useful for testing or manual runs.
     """
     try:
-        subprocess.run(["python", "ai_scheduler.py"], check=True)
+        subprocess.run(
+            ["python", "ai_scheduler.py"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
     except subprocess.CalledProcessError as e:
-        raise HTTPException(500, f"Scheduler failed: {e}")
+        # Capture and return any error output
+        detail = e.stderr.decode() if e.stderr else str(e)
+        raise HTTPException(status_code=500, detail=f"Scheduler failed:\n{detail}")
     return {"status": "completed"}
