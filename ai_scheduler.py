@@ -1,90 +1,142 @@
 #!/usr/bin/env python3
+"""
+AI‑driven Todoist scheduler
+
+– Reschedules overdue & unscheduled tasks only
+– Honors manual future due dates (skips them)
+– Takes into account Canadian holidays + your Google Calendar busy slots
+– Respects per‑day capacity (max_tasks_per_day)
+– Prioritizes higher‐priority tasks first
+– Timezone aware
+"""
+
 import os
-import sys
 import json
 import yaml
-import pytz
-import requests
-from datetime import datetime, timedelta, date
+from datetime import date, datetime, timedelta, time
+from zoneinfo import ZoneInfo
+
 from dotenv import load_dotenv
 import openai
-from openai import OpenAI
-from tenacity import retry, stop_after_attempt, wait_exponential
+from todoist_api_python.api import TodoistAPI
+from workalendar.america import Canada
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from workalendar.america import Canada
 
-# —— Load environment & config ——
-load_dotenv()
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-TODOIST_TOKEN = os.getenv("TODOIST_API_TOKEN")
-GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-if not (OPENAI_KEY and TODOIST_TOKEN and GOOGLE_CALENDAR_ID and GOOGLE_SERVICE_ACCOUNT_JSON):
-    print("⚠️ Missing required env vars: OPENAI_API_KEY, TODOIST_API_TOKEN, GOOGLE_CALENDAR_ID, GOOGLE_SERVICE_ACCOUNT_JSON")
-    sys.exit(1)
+# ─── Helpers ───────────────────────────────────────────────────────────────────
 
-with open("config.yaml", "r") as f:
-    cfg = yaml.safe_load(f)
+def load_config(path="config.yaml"):
+    with open(path, 'r') as f:
+        return yaml.safe_load(f)
 
-# —— Initialize Google Calendar client ——
-credentials_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-credentials = service_account.Credentials.from_service_account_info(
-    credentials_info,
-    scopes=["https://www.googleapis.com/auth/calendar"]
-)
-calendar_service = build("calendar", "v3", credentials=credentials)
+def today_local(tz_name):
+    tz = ZoneInfo(tz_name)
+    return datetime.now(tz).date()
 
-# —— Work-hour & Holiday settings ——
-cal = Canada()
-tz = pytz.timezone(cfg["timezone"])
-work_start = datetime.strptime(cfg["work_hours"]["start"], "%H:%M").time()
-work_end = datetime.strptime(cfg["work_hours"]["end"], "%H:%M").time()
+def get_project_tasks(api, project_id):
+    """Fetch all tasks in project (paginated)."""
+    return list(api.get_tasks(project_id=project_id))
 
-# —— Todoist API settings ——
-TODOIST_BASE = "https://api.todoist.com/rest/v2"
-HEADERS = {"Authorization": f"Bearer {TODOIST_TOKEN}", "Content-Type": "application/json"}
+def filter_tasks_to_schedule(tasks, today):
+    """
+    Keep only:
+      – tasks.due is None (unscheduled)
+      – OR tasks.due < today (overdue)
+    Skip any tasks with due >= today (manually scheduled in future).
+    """
+    to_schedule = []
+    for t in tasks:
+        if t.due is None and not t.recurring:
+            to_schedule.append(t)
+        elif t.due and not t.recurring:
+            d = datetime.fromisoformat(t.due.date).date()
+            if d < today:
+                to_schedule.append(t)
+    return to_schedule
 
-# —— OpenAI client setup ——
-client = OpenAI(api_key=OPENAI_KEY)
-
-# —— Helpers ——
-def is_working_day(d: date) -> bool:
-    return d.weekday() < 5 and cal.is_working_day(d)
-
-def get_available_dates(start: date, end: date) -> list[date]:
+def get_holiday_work_days(start_date, end_date):
+    cal = Canada()
     days = []
-    curr = start
-    while curr <= end:
-        if is_working_day(curr):
-            days.append(curr)
-        curr += timedelta(days=1)
+    d = start_date
+    while d <= end_date:
+        if cal.is_working_day(d):
+            days.append(d)
+        d += timedelta(days=1)
     return days
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-def call_openai(messages, functions=None):
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4.1-nano",
-            messages=messages,
-            functions=functions or [],
-            temperature=0
-        )
-    except Exception as e:
-        print(f"⚠️ OpenAI error: {e}. Falling back to gpt-4.1-mini…")
-        resp = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=messages,
-            functions=functions or [],
-            temperature=0
-        )
-    return resp.choices[0].message
+def get_calendar_busy_dates(start_date, end_date, calendar_id):
+    """Pull busy slots from Google Calendar and return set of dates."""
+    svc_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON', '')
+    if not svc_json or not calendar_id:
+        return set()
+    info = json.loads(svc_json)
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=['https://www.googleapis.com/auth/calendar.readonly']
+    )
+    service = build('calendar', 'v3', credentials=creds)
+    time_min = datetime.combine(start_date, time.min).isoformat() + 'Z'
+    time_max = datetime.combine(end_date,   time.max).isoformat() + 'Z'
+    events = service.events().list(
+        calendarId=calendar_id,
+        timeMin=time_min, timeMax=time_max,
+        singleEvents=True
+    ).execute().get('items', [])
+    busy = set()
+    for ev in events:
+        st = ev['start'].get('dateTime', ev['start'].get('date'))
+        dt = datetime.fromisoformat(st.replace('Z', '+00:00'))
+        busy.add(dt.date())
+    return busy
 
-# —— Schema definitions ——
-def make_schedule_function():
-    return {
+def call_openai(messages, functions):
+    client = openai.OpenAI()
+    resp = client.chat.completions.create(
+        model=os.getenv('OPENAI_MODEL', 'gpt-4o-mini'),
+        messages=messages,
+        functions=functions,
+        function_call={'name': 'assign_due_dates'}
+    )
+    return resp.choices[0].function_call
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    load_dotenv()
+    cfg = load_config()
+    api = TodoistAPI(os.getenv('TODOIST_API_TOKEN'))
+
+    # timezone & window
+    tz_name = cfg.get('timezone', 'UTC')
+    today = today_local(tz_name)
+    horizon = cfg.get('schedule_horizon_days', 7)
+    max_date = today + timedelta(days=horizon)
+
+    # fetch & filter
+    all_tasks = get_project_tasks(api, cfg['project_id'])
+    schedule_tasks = filter_tasks_to_schedule(all_tasks, today)
+    if not schedule_tasks:
+        print("✅ No overdue or unscheduled tasks to schedule.")
+        return
+
+    # compute dates
+    work_days = get_holiday_work_days(today, max_date)
+    print(f"🔍 Workdays: {[d.isoformat() for d in work_days]}")
+    busy = get_calendar_busy_dates(today, max_date, os.getenv('GOOGLE_CALENDAR_ID', ''))
+    if busy:
+        print(f"⏱ Calendar busy days: {[d.isoformat() for d in busy]}")
+    avail = [d for d in work_days if d not in busy]
+    print(f"✅ Available for scheduling: {[d.isoformat() for d in avail]}")
+    date_strs = [d.isoformat() for d in avail]
+
+    # sort by priority (1 highest)
+    schedule_tasks.sort(key=lambda t: t.priority)
+
+    # AI schema
+    fn = {
         "name": "assign_due_dates",
-        "description": "Assign due dates for tasks within available work days, favoring higher priorities.",
+        "description": "Pick a due_date for each task from the allowed dates, "
+                       "no more than max_tasks_per_day per date, "
+                       "and higher priority tasks first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -93,32 +145,9 @@ def make_schedule_function():
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string"},
-                            "priority": {"type": "integer", "minimum": 1, "maximum": 4},
-                            "due_date": {"type": "string", "format": "date"}
-                        },
-                        "required": ["id", "priority", "due_date"]
-                    }
-                }
-            },
-            "required": ["tasks"]
-        }
-    }
-
-def make_priority_function():
-    return {
-        "name": "set_priorities",
-        "description": "Set priority 1–4 for today's tasks.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "tasks": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "priority": {"type": "integer", "minimum": 1, "maximum": 4}
+                            "id":        {"type": "string"},
+                            "priority":  {"type": "integer"},
+                            "due_date":  {"type": "string", "format": "date"}
                         },
                         "required": ["id", "priority"]
                     }
@@ -128,110 +157,33 @@ def make_priority_function():
         }
     }
 
-# —— Compute date ranges ——
-now = datetime.now(tz)
-today = now.date()
-max_date = today + timedelta(days=cfg["schedule_horizon_days"])
-avail_dates = get_available_dates(today, max_date)
-# DEBUG: print out available work dates to verify on weekends/holidays
-print(f"🔍 Available work dates between {today.isoformat()} and {max_date.isoformat()}: {[d.isoformat() for d in avail_dates]}")
-date_strs = [d.isoformat() for d in avail_dates]
-
-# —— 1) Auto-schedule unscheduled & overdue tasks ——
-def get_unscheduled_tasks():
-    resp = requests.get(
-        f"{TODOIST_BASE}/tasks",
-        headers=HEADERS,
-        params={"project_id": cfg["project_id"]}
-    )
-    resp.raise_for_status()
-    tasks = resp.json()
-    return [
-        {"id": t["id"], "content": t["content"], "priority": t.get("priority", 4)}
-        for t in tasks
-        if not t.get("recurring", False)
-        and (
-            t.get("due") is None
-            or not t["due"].get("date")
-            or t["due"]["date"] < today.isoformat()
-        )
-    ]
-
-unscheduled = get_unscheduled_tasks()
-if unscheduled:
-    fn = make_schedule_function()
+    # build prompt
+    task_list = [{'id': t.id, 'priority': t.priority} for t in schedule_tasks]
     messages = [
-        {"role": "system", "content": "You are an AI scheduling tasks in Todoist. Use only the provided work dates and ensure every task gets a due_date."},
-        {
-            "role": "user",
-            "content": (
-                f"Available work dates: {date_strs}\n"
-                f"Here are tasks (with priority) to schedule:\n{json.dumps(unscheduled, indent=2)}\n"
-                f"Assign each a due_date from these dates, with at most {cfg['max_tasks_per_day']} tasks per day. Under no circumstances should due_date be empty; if unsure, assign the earliest available date. "
-                "Return a JSON object with key 'tasks', an array of {id, priority, due_date}."
-            )
-        }
+        {"role": "system", "content": "You are a helpful AI that schedules TODO tasks."},
+        {"role": "user", "content":
+         f"I have {len(task_list)} tasks to schedule (id & priority): {task_list}.  "
+         f"Allowed dates: {date_strs}.  "
+         f"Max tasks per day: {cfg.get('max_tasks_per_day', 5)}.  "
+         "Assign each task a due_date and return JSON {tasks:[{id,priority,due_date}]}."}
     ]
-    message = call_openai(messages, functions=[fn])
-    print("📝 Raw AI assignments:", message.function_call.arguments)
-    result = json.loads(message.function_call.arguments)
-    assignments = result.get("tasks", [])
 
-    for item in assignments:
-        due_str = item.get('due_date', '')
-        if not due_str:
-            print(f"⚠️ Skipping task {item.get('id')} with empty due_date")
-            continue
-        try:
-            due = date.fromisoformat(due_str)
-        except ValueError:
-            print(f"⚠️ Skipping task {item.get('id')} with invalid due_date '{due_str}'")
-            continue
-        requests.post(
-            f"{TODOIST_BASE}/tasks/{item['id']}",
-            headers=HEADERS,
-            json={"due_date": due_str}
-        ).raise_for_status()
-        start_dt = tz.localize(datetime.combine(due, work_start))
-        end_dt = tz.localize(datetime.combine(due, work_end))
-        event = {
-            "summary": item.get("content", "Task"),
-            "start": {"dateTime": start_dt.isoformat(), "timeZone": cfg['timezone']},
-            "end": {"dateTime": end_dt.isoformat(), "timeZone": cfg['timezone']},
-        }
-        calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
+    # call & parse
+    call = call_openai(messages, [fn])
+    result = json.loads(call.arguments)
+    assignments = result.get('tasks', [])
 
-# —— 2) Auto-prioritize today’s tasks ——
-resp = requests.get(
-    f"{TODOIST_BASE}/tasks",
-    headers=HEADERS,
-    params={"project_id": cfg["project_id"]}
-)
-resp.raise_for_status()
+    # apply
+    for a in assignments:
+        did, pri, ds = a['id'], a['priority'], a.get('due_date','')
+        if not ds:
+            ds = date_strs[0]
+            print(f"⚠️ AI returned empty for {did}, falling back to {ds}")
+        d_obj = date.fromisoformat(ds)
+        print(f"🔄 Setting task {did} (priority {pri}) → {ds}")
+        api.update_task(did, due={'date': ds})
 
-tasks_today = [
-    {"id": t["id"], "content": t["content"], "due": t["due"]["date"]}
-    for t in resp.json()
-    if t.get("due") and t["due"]["date"] <= today.isoformat()
-]
+    print("✅ Scheduler complete.")
 
-if tasks_today:
-    fn2 = make_priority_function()
-    messages = [
-        {"role": "system", "content": "You are a productivity coach for Todoist."},
-        {
-            "role": "user",
-            "content": (
-                f"Rank these tasks by importance for today:\n{json.dumps(tasks_today, indent=2)}\n"
-                "Return a JSON object with key 'tasks', an array of {id, priority}."
-            )
-        }
-    ]
-    message2 = call_openai(messages, functions=[fn2])
-    ranks = json.loads(message2.function_call.arguments).get("tasks", [])
-    for r in ranks:
-        requests.post(
-            f"{TODOIST_BASE}/tasks/{r['id']}", headers=HEADERS, json={"priority": r['priority']}
-        ).raise_for_status()
-
-print("✅ Scheduler run complete.")
+if __name__ == "__main__":
+    main()
