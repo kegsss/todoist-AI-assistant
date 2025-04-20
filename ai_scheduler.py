@@ -166,9 +166,9 @@ if unscheduled:
         {"role": "user", "content": (
             f"Available work dates: {date_strs}\n"
             f"Here are tasks (with priority) to schedule:\n{json.dumps(unscheduled, indent=2)}\n"
-            f"Assign each a due_date from these dates, with at most {cfg['max_tasks_per_day']} tasks per day, and ensure every task gets a due_date. "
-            "Return a JSON object with key 'tasks', an array of {id, priority, due_date}."
-        )}
+            f"Assign each a due_date from these dates, with at most {cfg['max_tasks_per_day']} tasks per day. Under no circumstances should any due_date be empty; if you cannot determine a better date, assign the earliest available work date."
+            " Return a JSON object with key 'tasks', an array of objects each containing id, priority, and due_date."
+        )}}
     ]
     message = call_openai(messages, functions=[fn])
     # debug log raw AI response
