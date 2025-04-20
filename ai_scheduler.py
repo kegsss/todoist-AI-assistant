@@ -5,7 +5,8 @@ import json
 import yaml
 import pytz
 import requests
-from datetime import datetime, timedelta, date\ nfrom dotenv import load_dotenv
+from datetime import datetime, timedelta, date
+from dotenv import load_dotenv
 import openai
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
