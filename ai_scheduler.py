@@ -5,7 +5,7 @@ import json
 import yaml
 import pytz
 import requests
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
 from dotenv import load_dotenv
 import openai
 from openai import OpenAI
@@ -80,34 +80,11 @@ def call_openai(messages, functions=None):
         )
     return resp.choices[0].message
 
-# —— Schema definitions ——
-def make_duration_function():
-    return {
-        "name": "estimate_durations",
-        "description": "Estimate the duration in hours for each task based on its content.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "tasks": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "content": {"type": "string"}
-                        },
-                        "required": ["id", "content"]
-                    }
-                }
-            },
-            "required": ["tasks"]
-        }
-    }
-
+# —— Schema for scheduling ——
 def make_schedule_function():
     return {
         "name": "assign_due_dates",
-        "description": "Assign due dates for tasks within available work days, favoring higher priorities and considering duration.",
+        "description": "Assign due dates and durations for tasks within available work days, favoring higher priorities and distributing start times.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -118,9 +95,10 @@ def make_schedule_function():
                         "properties": {
                             "id": {"type": "string"},
                             "priority": {"type": "integer", "minimum": 1, "maximum": 4},
-                            "duration_hours": {"type": "number", "minimum": 0.1}
+                            "due_date": {"type": "string", "format": "date"},
+                            "duration_hours": {"type": "number", "minimum": 0.25}
                         },
-                        "required": ["id", "priority", "duration_hours"]
+                        "required": ["id", "priority", "due_date", "duration_hours"]
                     }
                 }
             },
@@ -158,85 +136,67 @@ def get_unscheduled_tasks():
 
 unscheduled = get_unscheduled_tasks()
 if unscheduled:
-    # --- Step 1a: Estimate durations ---
-    fn_dur = make_duration_function()
-    dur_msgs = [
-        {"role": "system", "content": "You are an AI that estimates how many hours each task will take."},
-        {"role": "user", "content": (
-            f"Here are pending tasks (id & content):\n{json.dumps(unscheduled, indent=2)}\n"
-            "Return JSON with key 'tasks': an array of {id, duration_hours}."
-        )}
+    fn = make_schedule_function()
+    messages = [
+        {"role": "system", "content": "You are an AI scheduling tasks. Use only the dates provided, assign due_date and duration_hours."},
+        {"role": "user",
+         "content": (
+             f"Available dates: {date_strs}\n"
+             f"Tasks (id, priority): {json.dumps(unscheduled, indent=2)}\n"
+             f"Max {cfg['max_tasks_per_day']} per day. Return JSON 'tasks':[{{id, priority, due_date, duration_hours}}]."
+         )}
     ]
-    dur_resp = call_openai(dur_msgs, functions=[fn_dur])
-    raw_durs = dur_resp.function_call.arguments
-    print("🕒 Raw AI duration estimates:", raw_durs)
-    dur_result = json.loads(raw_durs).get("tasks", [])
+    ai_msg = call_openai(messages, functions=[fn])
+    raw = ai_msg.function_call.arguments
+    print("📝 Raw AI assignments:", raw)
+    result = json.loads(raw)
+    assignments = result.get("tasks", [])
 
-    # Merge durations into unscheduled list
-    default_dur = cfg.get('default_task_duration_hours', 1)
-    for u in unscheduled:
-        match = next((d for d in dur_result if d['id'] == u['id']), None)
-        u['duration_hours'] = match.get('duration_hours', default_dur) if match else default_dur
+    # sanitize & fill defaults
+    for item in assignments:
+        # ensure due_date valid
+        if item.get('due_date') not in date_strs:
+            item['due_date'] = date_strs[0]
+        # ensure within horizon
+        if item['due_date'] < today.isoformat():
+            item['due_date'] = date_strs[0]
+        # ensure duration
+        if not isinstance(item.get('duration_hours'), (int, float)) or item['duration_hours'] <= 0:
+            item['duration_hours'] = cfg.get('default_task_duration_hours', 1)
 
-    # --- Step 1b: Assign due dates ---
-    fn_sch = make_schedule_function()
-    sch_msgs = [
-        {"role": "system", "content": "You are an AI scheduling tasks by due date within available work days."},
-        {"role": "user", "content": (
-            f"Available dates: {date_strs}\n"
-            f"Tasks (id, priority, duration_hours):\n{json.dumps(unscheduled, indent=2)}\n"
-            f"Schedule each task no more than {cfg['max_tasks_per_day']} per day. "
-            "Return JSON with key 'tasks': an array of {id, priority, due_date}."
-        )}
-    ]
-    sch_resp = call_openai(sch_msgs, functions=[fn_sch])
-    raw_sched = sch_resp.function_call.arguments
-    print("📝 Raw AI scheduling assignments:", raw_sched)
-    sch_result = json.loads(raw_sched).get("tasks", [])
+    # sort by due_date, then priority (1 highest)
+    assignments.sort(key=lambda x: (x['due_date'], x['priority']))
 
-    # Sanitize & correct assignments
-    sanitized = []
-    for item in sch_result:
-        tid = item.get('id')
-        due = item.get('due_date')
-        # missing or invalid => earliest
-        if due not in date_strs:
-            corrected = date_strs[0]
-            print(f"⚠️ Corrected task {tid}: invalid/missing due_date '{due}' → '{corrected}'")
-            due = corrected
-        # overdue => reassign
-        if due < today.isoformat():
-            due = date_strs[0]
-            print(f"⚠️ Reassigning overdue date for task {tid} → '{due}'")
-        item['due_date'] = due
-        sanitized.append(item)
+    # keep track of next free start per date
+    next_start: dict[str, time] = {d: work_start for d in date_strs}
 
-    # Apply to Todoist & Calendar
-    for item in sanitized:
+    # apply assignments sequentially
+    for item in assignments:
         due = date.fromisoformat(item['due_date'])
-        dur = next(u['duration_hours'] for u in unscheduled if u['id'] == item['id'])
-        # compute start/end
-        start_dt = tz.localize(datetime.combine(due, work_start))
+        dur = item['duration_hours']
+        start_t = next_start[item['due_date']]
+        start_dt = tz.localize(datetime.combine(due, start_t))
         end_dt = start_dt + timedelta(hours=dur)
+        # clamp within work_end
         if end_dt.time() > work_end:
             end_dt = tz.localize(datetime.combine(due, work_end))
-        # update Todoist
+        # update next free slot for date
+        next_start[item['due_date']] = end_dt.time()
+        # update Todoist due_date
         requests.post(
             f"{TODOIST_BASE}/tasks/{item['id']}",
             headers=HEADERS,
             json={"due_date": item['due_date']}
         ).raise_for_status()
-        # create calendar event
-        # fetch content for summary
-        summary = next(u['content'] for u in unscheduled if u['id'] == item['id'])
+        # create calendar event with actual title
         event = {
-            "summary": summary,
+            "summary": item.get("content", "Task"),
             "start": {"dateTime": start_dt.isoformat(), "timeZone": cfg['timezone']},
             "end": {"dateTime": end_dt.isoformat(), "timeZone": cfg['timezone']},
         }
         calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
 
-# —— 2) Auto-prioritize today’s tasks ——
+# —— 2) Auto-prioritize today's tasks ——
 resp = requests.get(
     f"{TODOIST_BASE}/tasks",
     headers=HEADERS,
@@ -254,33 +214,17 @@ if tasks_today:
     fn2 = {
         "name": "set_priorities",
         "description": "Set priority for today's tasks based on importance.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "tasks": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "priority": {"type": "integer", "minimum": 1, "maximum": 4}
-                        },
-                        "required": ["id", "priority"]
-                    }
-                }
-            },
-            "required": ["tasks"]
-        }
+        "parameters": {"type": "object", "properties": {"tasks": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "priority": {"type": "integer", "minimum":1, "maximum":4}}, "required":["id","priority"]}}}, "required":["tasks"]}
     }
-    msgs2 = [
+    messages2 = [
         {"role": "system", "content": "You are a productivity coach for Todoist."},
         {"role": "user", "content": (
             f"Rank these tasks by importance for today:\n{json.dumps(tasks_today, indent=2)}\n"
-            "Return JSON with key 'tasks': an array of {id, priority}."
+            "Return JSON with 'tasks': [{id, priority}]."
         )}
     ]
-    res2 = call_openai(msgs2, functions=[fn2])
-    ranks = json.loads(res2.function_call.arguments).get("tasks", [])
+    msg2 = call_openai(messages2, functions=[fn2])
+    ranks = json.loads(msg2.function_call.arguments).get("tasks", [])
     for r in ranks:
         requests.post(
             f"{TODOIST_BASE}/tasks/{r['id']}", headers=HEADERS, json={"priority": r['priority']}
