@@ -10,17 +10,17 @@ from dotenv import load_dotenv
 import openai
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
-#from google.oauth2 import service_account
-#from googleapiclient.discovery import build
+# Calendar integrations have been commented out as per request
+# from google.oauth2 import service_account
+# from googleapiclient.discovery import build
 from workalendar.america import Canada
 
 # —— Load environment & config ——
 load_dotenv()
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 TODOIST_TOKEN = os.getenv("TODOIST_API_TOKEN")
-# Commented out Google Calendar as per request
-#GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
-#GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+# GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
+# GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 if not (OPENAI_KEY and TODOIST_TOKEN):
     print("⚠️ Missing required env vars: OPENAI_API_KEY, TODOIST_API_TOKEN")
     sys.exit(1)
@@ -28,14 +28,7 @@ if not (OPENAI_KEY and TODOIST_TOKEN):
 with open("config.yaml", "r") as f:
     cfg = yaml.safe_load(f)
 
-# —— Initialize Google Calendar client ——
-# (Removed — calendar events will no longer be created)
-#credentials_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-#credentials = service_account.Credentials.from_service_account_info(
-#    credentials_info,
-#    scopes=["https://www.googleapis.com/auth/calendar"]
-#)
-#calendar_service = build("calendar", "v3", credentials=credentials)
+# —— (Google Calendar client initialization removed) ——
 
 # —— Work-hour & Holiday settings ——
 cal = Canada()
@@ -137,12 +130,13 @@ def get_unscheduled_tasks():
     ]
 
 unscheduled = get_unscheduled_tasks()
+# map id -> content for logging
 id_to_content = {t["id"]: t["content"] for t in unscheduled}
 
 if unscheduled:
     fn = make_schedule_function()
     messages = [
-        {"role": "system", "content": "You are an AI scheduling tasks in Todoist. Use only the provided dates and ensure each task gets due_date and duration_minutes."},
+        {"role": "system", "content": "You are an AI scheduling tasks in Todoist. Use only the provided work dates and ensure every task gets due_date and duration_minutes."},
         {"role": "user",
          "content": (
              f"Available dates: {date_strs}\n"
@@ -160,17 +154,21 @@ if unscheduled:
     sanitized = []
     for item in assignments:
         tid = item.get('id')
+        # ensure due_date
         due = item.get('due_date')
         if not due or due not in date_strs:
             due = date_strs[0]
             print(f"⚠️ Corrected task {tid}: invalid/missing due_date → '{due}'")
+        # ensure not past
         if due < today.isoformat():
-            print(f"⚠️ Reassigning overdue for {tid}: '{due}' → '{date_strs[0]}'")
+            print(f"⚠️ Reassigning overdue date for task {tid}: '{due}' → '{date_strs[0]}'")
             due = date_strs[0]
+        # ensure duration
         dur = item.get('duration_minutes')
         if not isinstance(dur, int) or dur < 1:
             dur = cfg.get('default_task_duration_minutes', 60)
             print(f"⚠️ Corrected task {tid}: invalid/missing duration_minutes → {dur}")
+        # attach content and priority
         sanitized.append({
             'id': tid,
             'priority': item.get('priority', 4),
@@ -179,15 +177,21 @@ if unscheduled:
             'content': id_to_content.get(tid, 'Task')
         })
 
-    # slot tracking
+    # schedule without overlaps
     day_slots = {d: datetime.combine(d, work_start) for d in avail_dates}
+
     for item in sorted(sanitized, key=lambda x: (x['due_date'], x['priority'])):
-        due_date = date.fromisoformat(item['due_date'])
-        start = day_slots[due_date]
-        end = start + timedelta(minutes=item['duration_minutes'])
-        if end.time() > work_end:
-            end = datetime.combine(due_date, work_end)
-        print(f"🗓 Scheduled {item['id']} ('{item['content']}') on {due_date} from {start.time()} to {end.time()} ({item['duration_minutes']} min)")
+        due = date.fromisoformat(item['due_date'])
+        start_dt_naive = day_slots[due]
+        start_dt = tz.localize(start_dt_naive)
+        dur = item['duration_minutes']
+        end_dt = start_dt + timedelta(minutes=dur)
+        work_end_dt = tz.localize(datetime.combine(due, work_end))
+        if end_dt > work_end_dt:
+            end_dt = work_end_dt
+        # log including priority, date, time, and duration
+        print(f"🗓 Scheduling {item['id']} ('{item['content']}') priority={item['priority']} "
+              f"on {due} from {start_dt.time()} to {end_dt.time()} ({dur} min)")
         # update Todoist
         requests.post(
             f"{TODOIST_BASE}/tasks/{item['id']}",
@@ -195,9 +199,9 @@ if unscheduled:
             json={"due_date": item['due_date']}
         ).raise_for_status()
         # advance slot
-        day_slots[due_date] = end
+        day_slots[due] = end_dt.replace(tzinfo=None)
 
-# —— 2) Auto-prioritize today's tasks ——
+# —— 2) Auto-prioritize today’s tasks ——
 resp = requests.get(
     f"{TODOIST_BASE}/tasks",
     headers=HEADERS,
@@ -227,6 +231,7 @@ if tasks_today:
     msg2 = call_openai(messages2, functions=[fn2])
     ranks = json.loads(msg2.function_call.arguments).get("tasks", [])
     for r in ranks:
+        print(f"🔧 Setting priority for {r['id']} → {r['priority']}")
         requests.post(
             f"{TODOIST_BASE}/tasks/{r['id']}", headers=HEADERS, json={"priority": r['priority']}
         ).raise_for_status()
