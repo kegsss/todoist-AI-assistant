@@ -73,8 +73,9 @@ def call_openai(messages, functions=None):
             functions=functions or [],
             temperature=0
         )
-    except openai.RateLimitError:
-        print("⚠️ nano quota exhausted, falling back to mini…")
+    except Exception as e:
+        # Fallback to mini on rate limit or other errors
+        print(f"⚠️ OpenAI error: {e}. Falling back to gpt-4.1-mini…")
         resp = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=messages,
@@ -83,7 +84,7 @@ def call_openai(messages, functions=None):
         )
     return resp.choices[0].message
 
-# —— Scheduling function schema ——
+# —— Schema definitions ——
 def make_schedule_function():
     return {
         "name": "assign_due_dates",
@@ -108,7 +109,7 @@ def make_schedule_function():
         }
     }
 
-# —— Priority function schema ——
+
 def make_priority_function():
     return {
         "name": "set_priorities",
@@ -149,7 +150,7 @@ def get_unscheduled_tasks():
     resp.raise_for_status()
     tasks = resp.json()
     return [
-        {"id": t["id"], "content": t["content"], "priority": t.get("priority", 1)}
+        {"id": t["id"], "content": t["content"], "priority": t.get("priority", 4)}
         for t in tasks
         if not t.get("recurring", False)
         and (
@@ -167,23 +168,30 @@ if unscheduled:
         {"role": "user", "content": (
             f"Available work dates: {date_strs}\n"
             f"Here are tasks (with priority) to schedule:\n{json.dumps(unscheduled, indent=2)}\n"
-            f"Assign each a due_date from these dates, with at most {cfg['max_tasks_per_day']} tasks per day. "
-            "Return a JSON object with key 'tasks', an array of {id, priority, due_date}."
+            f"Assign each a due_date from these dates, with at most {cfg['max_tasks_per_day']} tasks per day. Return a JSON object with key 'tasks', an array of {{id, priority, due_date}}."
         )}
     ]
     message = call_openai(messages, functions=[fn])
     result = json.loads(message.function_call.arguments)
-    assignments = result["tasks"]
+    assignments = result.get("tasks", [])
 
     for item in assignments:
+        due_str = item.get('due_date', '')
+        if not due_str:
+            print(f"⚠️ Skipping task {item.get('id')} with empty due_date")
+            continue
+        try:
+            due = date.fromisoformat(due_str)
+        except ValueError:
+            print(f"⚠️ Skipping task {item.get('id')} with invalid due_date '{due_str}'")
+            continue
         # Update Todoist
         requests.post(
             f"{TODOIST_BASE}/tasks/{item['id']}",
             headers=HEADERS,
-            json={"due_date": item['due_date']}
+            json={"due_date": due_str}
         ).raise_for_status()
         # Create Calendar event
-        due = date.fromisoformat(item['due_date'])
         start_dt = tz.localize(datetime.combine(due, work_start))
         end_dt   = tz.localize(datetime.combine(due, work_end))
         event = {
@@ -215,11 +223,11 @@ if tasks_today:
         {"role": "system", "content": "You are a productivity coach for Todoist."},
         {"role": "user", "content": (
             f"Rank these tasks by importance for today:\n{json.dumps(tasks_today, indent=2)}\n"
-            "Return a JSON object with key 'tasks', an array of {id, priority}."
+            "Return a JSON object with key 'tasks', an array of {{id, priority}}."
         )}
     ]
     message2 = call_openai(messages, functions=[fn2])
-    ranks = json.loads(message2.function_call.arguments)["tasks"]
+    ranks = json.loads(message2.function_call.arguments).get("tasks", [])
     for r in ranks:
         requests.post(
             f"{TODOIST_BASE}/tasks/{r['id']}",
