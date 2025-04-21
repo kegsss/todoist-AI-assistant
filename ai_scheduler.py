@@ -148,7 +148,7 @@ if unscheduled:
     assigns = json.loads(resp_msg.function_call.arguments).get("tasks",[])
     
     # Schedule in Todoist with duration
-    slots = {d:datetime.combine(d,work_start).astimezone(tz) for d in avail_dates}
+    slots = {d: tz.localize(datetime.combine(d, work_start))for d in avail_dates}
     for a in assigns:
         tid   = a['id']
         due   = a.get('due_date', date_strs[0])
