@@ -177,18 +177,23 @@ for task in unscheduled:
 
 # —— 4) AI assignment ——
 if unscheduled:
+    # —— 4) AI assignment ——
+if unscheduled:
+    # Prepare AI prompt content
+    tasks_list = [{"id": t["id"], "priority": t["priority"]} for t in unscheduled]
+    user_content = (
+        f"Dates: {date_strs}
+"
+        f"Tasks: {json.dumps(tasks_list)}
+"
+        f"Max/day: {cfg['max_tasks_per_day']}"
+    )
     msgs = [
         {"role": "system", "content": "You are an AI scheduling tasks."},
-        {"role": "user", "content": (
-            f"Dates: {date_strs}
-"
-            f"Tasks: {json.dumps([{'id': t['id'], 'priority': t['priority']} for t in unscheduled])}
-"
-            f"Max/day: {cfg['max_tasks_per_day']}"
-        )}
+        {"role": "user",   "content": user_content}
     ]
-    res = call_openai(msgs, functions=[make_schedule_function()], function_call={"name": "assign_due_dates"})
-    assigns = json.loads(res.function_call.arguments).get("tasks", [])(res.function_call.arguments).get('tasks', [])
+    res     = call_openai(msgs, functions=[make_schedule_function()], function_call={"name": "assign_due_dates"})
+    assigns = json.loads(res.function_call.arguments).get("tasks", [])(res.function_call.arguments).get("tasks", [])(res.function_call.arguments).get('tasks', [])
 
     print("🧠 AI raw assignments:")
     for a in assigns:
