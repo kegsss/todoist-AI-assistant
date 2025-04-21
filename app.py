@@ -64,39 +64,45 @@ last_scheduler_run = datetime.min
 @app.on_event("startup")
 def register_calendar_watches():
     """
-    Register webhooks for both the Todoist calendar and work calendar
+    Register webhooks for the work calendar and Todoist item updated event
     """
-    # Register webhook for the Todoist calendar
-    channel_id1 = str(uuid.uuid4())
-    body1 = {
-        "id":      channel_id1,
-        "type":    "web_hook",
-        "address": CALENDAR_WEBHOOK_URL,
-        "params":  {"ttl": "86400"}
-    }
-    resp1 = calendar_service.events().watch(
-        calendarId=GOOGLE_CAL_ID,
-        body=body1
-    ).execute()
-    print("🛰️ Todoist calendar watch registered:", resp1)
-    
-    # Register webhook for your work calendar
+    # Register webhook for the work calendar only (not Todoist calendar)
     work_cal_id = "keagan@togetherplatform.com"
     try:
-        channel_id2 = str(uuid.uuid4())
-        body2 = {
-            "id":      channel_id2,
+        channel_id = str(uuid.uuid4())
+        body = {
+            "id":      channel_id,
             "type":    "web_hook",
             "address": CALENDAR_WEBHOOK_URL,
             "params":  {"ttl": "86400"}
         }
-        resp2 = calendar_service.events().watch(
+        resp = calendar_service.events().watch(
             calendarId=work_cal_id,
-            body=body2
+            body=body
         ).execute()
-        print("🛰️ Work calendar watch registered:", resp2)
+        print("🛰️ Work calendar watch registered:", resp)
     except Exception as e:
         print(f"⚠️ Failed to register webhook for work calendar: {str(e)}")
+    
+    # Register webhook for Todoist item:updated event
+    access_token = store.get("access_token", STATIC_TOKEN)
+    if access_token:
+        try:
+            headers = {"Authorization": f"Bearer {access_token}"}
+            webhook_data = {
+                "event_types": ["item:updated"],
+                "project_id": PROJECT_ID,
+                "webhook_url": WEBHOOK_URL
+            }
+            resp = requests.post(
+                f"{TODOIST_BASE}/webhooks",
+                headers=headers,
+                json=webhook_data
+            )
+            resp.raise_for_status()
+            print(f"🛰️ Todoist item:updated webhook registered: {resp.json()}")
+        except Exception as e:
+            print(f"⚠️ Failed to register Todoist item:updated webhook: {str(e)}")
 
 # ── Health check ──
 @app.get("/healthz")
@@ -149,9 +155,24 @@ async def auth_callback(request: Request):
         raise HTTPException(500, "No access token returned")
 
     store["access_token"] = token
-
-    # Note: Todoist webhooks must be activated manually in the App Management Console
-    print("⚠️ Remember to enable Webhooks for your app at https://todoist.com/appconsole")
+    
+    # Register webhook for Todoist item:updated event with the new token
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        webhook_data = {
+            "event_types": ["item:updated"],
+            "project_id": PROJECT_ID,
+            "webhook_url": WEBHOOK_URL
+        }
+        resp = requests.post(
+            f"{TODOIST_BASE}/webhooks",
+            headers=headers,
+            json=webhook_data
+        )
+        resp.raise_for_status()
+        print(f"🛰️ Todoist item:updated webhook registered after OAuth: {resp.json()}")
+    except Exception as e:
+        print(f"⚠️ Failed to register Todoist item:updated webhook: {str(e)}")
 
     return PlainTextResponse("✅ OAuth complete! You can close this tab.", status_code=200)
 
@@ -183,20 +204,29 @@ async def todoist_webhook(req: Request):
         return PlainTextResponse("ignored", status_code=200)
 
     task_id = event_data.get("id")
-    print("📬 Webhook received for project event", event, "task:", task_id)
+    print(f"📬 Webhook received for {event} event, task: {task_id}")
 
-    # delete any existing calendar events for that task
-    if task_id:
-        q = f"[{task_id}]"
-        existing = calendar_service.events().list(
-            calendarId=GOOGLE_CAL_ID, q=q
-        ).execute().get("items", [])
-        for ev in existing:
-            calendar_service.events().delete(
-                calendarId=GOOGLE_CAL_ID,
-                eventId=ev["id"]
-            ).execute()
-            print(f"🗑 Deleted calendar event {ev['id']} for task {task_id}")
+    # Handle item:updated event specifically
+    if event == "item:updated":
+        print(f"🔄 Task updated in Todoist: {task_id}")
+        
+        # Check if we need to update calendar event
+        due_info = event_data.get("due")
+        if due_info:
+            print(f"📅 Task has due date: {due_info}")
+            
+            # delete any existing calendar events for that task
+            if task_id:
+                q = f"[{task_id}]"
+                existing = calendar_service.events().list(
+                    calendarId=GOOGLE_CAL_ID, q=q
+                ).execute().get("items", [])
+                for ev in existing:
+                    calendar_service.events().delete(
+                        calendarId=GOOGLE_CAL_ID,
+                        eventId=ev["id"]
+                    ).execute()
+                    print(f"🗑 Deleted calendar event {ev['id']} for task {task_id}")
 
     # fire off your scheduler in background
     env = os.environ.copy()
