@@ -1,4 +1,3 @@
-# app.py
 #!/usr/bin/env python3
 import os
 import json
@@ -15,28 +14,38 @@ from googleapiclient.discovery import build
 app = FastAPI()
 
 # ── Configuration ──
-CLIENT_ID           = os.getenv("TODOIST_CLIENT_ID")
-CLIENT_SECRET       = os.getenv("TODOIST_CLIENT_SECRET")
-REDIRECT_URI        = os.getenv("OAUTH_REDIRECT_URI")
-WEBHOOK_URL         = os.getenv("WEBHOOK_URL")          # e.g. https://…/webhook
-STATIC_TOKEN        = os.getenv("TODOIST_API_TOKEN")
-GOOGLE_CAL_JSON     = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-GOOGLE_CAL_ID       = os.getenv("GOOGLE_CALENDAR_ID")
-CALENDAR_WEBHOOK_URL= os.getenv("CALENDAR_WEBHOOK_URL")   # e.g. https://…/calendar/webhook
-PROJECT_ID          = int(os.getenv("PROJECT_ID"))      # your Todoist project ID
+CLIENT_ID            = os.getenv("TODOIST_CLIENT_ID")
+CLIENT_SECRET        = os.getenv("TODOIST_CLIENT_SECRET")
+REDIRECT_URI         = os.getenv("OAUTH_REDIRECT_URI")    # must match your Todoist app settings
+WEBHOOK_URL          = os.getenv("WEBHOOK_URL")           # e.g. https://…/webhook
+STATIC_TOKEN         = os.getenv("TODOIST_API_TOKEN")     # fallback for ai_scheduler
+GOOGLE_CAL_JSON      = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+GOOGLE_CAL_ID        = os.getenv("GOOGLE_CALENDAR_ID")
+CALENDAR_WEBHOOK_URL = os.getenv("CALENDAR_WEBHOOK_URL")  # e.g. https://…/calendar/webhook
+PROJECT_ID           = os.getenv("PROJECT_ID")           # your Todoist project ID
 
-# Validate env
-for var in (
-    CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, WEBHOOK_URL,
-    GOOGLE_CAL_JSON, GOOGLE_CAL_ID, CALENDAR_WEBHOOK_URL, PROJECT_ID
-):
-    if not var:
-        raise RuntimeError("Missing one of required environment variables.")
+# validate that nothing’s missing
+required = {
+    "TODOIST_CLIENT_ID": CLIENT_ID,
+    "TODOIST_CLIENT_SECRET": CLIENT_SECRET,
+    "OAUTH_REDIRECT_URI": REDIRECT_URI,
+    "WEBHOOK_URL": WEBHOOK_URL,
+    "TODOIST_API_TOKEN": STATIC_TOKEN,
+    "GOOGLE_SERVICE_ACCOUNT_JSON": GOOGLE_CAL_JSON,
+    "GOOGLE_CALENDAR_ID": GOOGLE_CAL_ID,
+    "CALENDAR_WEBHOOK_URL": CALENDAR_WEBHOOK_URL,
+    "PROJECT_ID": PROJECT_ID,
+}
+missing = [k for k,v in required.items() if not v]
+if missing:
+    raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
 
-# In‑memory OAuth store
+PROJECT_ID = int(PROJECT_ID)
+
+# ── In‑memory OAuth store ──
 store = {}
 
-# Initialize Google Calendar client
+# ── Initialize Google Calendar client ──
 creds_info = json.loads(GOOGLE_CAL_JSON)
 creds = service_account.Credentials.from_service_account_info(
     creds_info, scopes=["https://www.googleapis.com/auth/calendar"]
@@ -45,6 +54,9 @@ calendar_service = build("calendar", "v3", credentials=creds)
 
 @app.on_event("startup")
 def register_calendar_watch():
+    """
+    Ask Google Calendar to POST us changes on your 'Todoist' calendar.
+    """
     channel_id = str(uuid.uuid4())
     body = {
         "id":      channel_id,
@@ -58,12 +70,13 @@ def register_calendar_watch():
     ).execute()
     print("🛰️ Calendar watch registered:", resp)
 
-# Health check
+# ── Health check ──
 @app.get("/healthz")
 def healthz():
     return PlainTextResponse("OK", status_code=200)
 
-# Manual trigger\ n@app.get("/run")
+# ── Manual trigger ──
+@app.get("/run")
 def run_scheduler():
     env = os.environ.copy()
     env["TODOIST_API_TOKEN"] = store.get("access_token", STATIC_TOKEN)
@@ -73,7 +86,7 @@ def run_scheduler():
         raise HTTPException(status_code=500, detail=f"Scheduler failed: {e}")
     return {"status": "completed"}
 
-# OAuth start
+# ── OAuth start ──
 @app.get("/login")
 def login():
     params = {
@@ -82,10 +95,10 @@ def login():
         "state":        "todoist_integration",
         "redirect_uri": REDIRECT_URI,
     }
-    url = "https://todoist.com/oauth/authorize?" + "&".join(f"{k}={v}" for k,v in params.items())
+    url = "https://todoist.com/oauth/authorize?" + "&".join(f"{k}={v}" for k, v in params.items())
     return RedirectResponse(url)
 
-# OAuth callback
+# ── OAuth callback ──
 @app.get("/auth/callback")
 async def auth_callback(request: Request):
     code  = request.query_params.get("code")
@@ -109,7 +122,7 @@ async def auth_callback(request: Request):
 
     store["access_token"] = token
 
-    # subscribe to project webhooks
+    # subscribe to your project's webhooks via unified v1 sync
     try:
         subscribe_to_webhook(token, WEBHOOK_URL)
     except Exception as e:
@@ -118,62 +131,64 @@ async def auth_callback(request: Request):
     return PlainTextResponse("✅ OAuth complete! You can close this tab.", status_code=200)
 
 def subscribe_to_webhook(access_token: str, webhook_url: str):
+    """
+    Register /webhook for item:added, item:completed, item:deleted on your project,
+    using the unified v1 sync endpoint.
+    """
     payload = {
         "sync_token":     "*",
         "resource_types": ["item:added", "item:completed", "item:deleted"],
         "webhook_url":    webhook_url,
         "project_id":     PROJECT_ID
     }
-    # use Sync v9
     resp = requests.post(
-        "https://api.todoist.com/sync/v9/sync",
+        "https://api.todoist.com/api/v1/sync",
         headers={"Authorization": f"Bearer {access_token}"},
         json=payload,
     )
     resp.raise_for_status()
-    print("✅ Subscribed to Todoist webhooks (v9):", resp.json())
+    print("✅ Subscribed to Todoist webhooks (v1):", resp.json())
 
-# Todoist validation ping
+# ── Todoist validation ping ──
 @app.get("/webhook")
 async def webhook_ping():
     return PlainTextResponse("OK", status_code=200)
 
-# Incoming webhooks
+# ── Incoming Todoist webhooks ──
 @app.post("/webhook")
 async def todoist_webhook(req: Request):
     data    = await req.json()
     event   = data.get("event_name")
     payload = data.get("event_data", {})
 
+    # ignore events outside your configured project
     if payload.get("project_id") != PROJECT_ID:
         return PlainTextResponse("ignored", 200)
 
     task_id = payload.get("id")
-    print("📬 Webhook for project:", event, "task:", task_id)
+    print("📬 Webhook received for project:", event, "task:", task_id)
 
-    # delete existing calendar events
+    # delete any existing calendar events for that task
     if task_id:
         q = f"[{task_id}]"
         existing = calendar_service.events().list(
-            calendarId=GOOGLE_CAL_ID,
-            q=q
+            calendarId=GOOGLE_CAL_ID, q=q
         ).execute().get("items", [])
         for ev in existing:
             calendar_service.events().delete(
                 calendarId=GOOGLE_CAL_ID,
                 eventId=ev["id"]
             ).execute()
-            print(f"🗑 Deleted event {ev['id']} for task {task_id}")
+            print(f"🗑 Deleted calendar event {ev['id']} for task {task_id}")
 
-    # fire scheduler
+    # fire off your scheduler in background
     env = os.environ.copy()
     env["TODOIST_API_TOKEN"] = store.get("access_token", STATIC_TOKEN)
     subprocess.Popen(["python", "ai_scheduler.py"], env=env)
 
     return PlainTextResponse("OK", status_code=200)
 
-
-# Calendar push notifications
+# ── Google Calendar push notifications ──
 @app.post("/calendar/webhook")
 async def calendar_webhook(
     req: Request,
@@ -181,9 +196,11 @@ async def calendar_webhook(
     x_goog_resource_state: str = Header(None),
 ):
     print(f"📬 Calendar notification: state={x_goog_resource_state}")
+    # only handle “exists” (changed) pushes
     if x_goog_resource_state != "exists":
         return PlainTextResponse("ignored", 200)
 
+    # look at events ended in the last few minutes
     window_start = (datetime.utcnow() - timedelta(minutes=5)).isoformat() + "Z"
     now          = datetime.utcnow().isoformat() + "Z"
     events = calendar_service.events().list(
@@ -196,62 +213,10 @@ async def calendar_webhook(
 
     for ev in events:
         summary = ev.get("summary", "")
+        # if not yet marked complete (no leading “✓ ”)
         if summary.startswith("[") and not summary.startswith("✓"):
             tid = summary[1:summary.index("]")]
             print(f"⚠️ Task {tid} slot ended but not done; re‑queuing…")
-            subprocess.Popen(["python","ai_scheduler.py"])
+            subprocess.Popen(["python", "ai_scheduler.py"])
 
-    return PlainTextResponse("OK", 200)
-
-
-# ai_scheduler.py
-#!/usr/bin/env python3
-import os
-import sys
-import json
-import yaml
-import pytz
-import requests
-from datetime import datetime, timedelta, date
-from dotenv import load_dotenv
-import openai
-from openai import OpenAI
-from tenacity import retry, stop_after_attempt, wait_exponential
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from workalendar.america import Canada
-
-# Load env & config\ nload_dotenv()
-OPENAI_KEY               = os.getenv("OPENAI_API_KEY")
-TODOIST_TOKEN            = os.getenv("TODOIST_API_TOKEN")
-GOOGLE_CALENDAR_ID       = os.getenv("GOOGLE_CALENDAR_ID")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-if not all([OPENAI_KEY, TODOIST_TOKEN, GOOGLE_CALENDAR_ID, GOOGLE_SERVICE_ACCOUNT_JSON]):
-    print("⚠️ Missing required env vars")
-    sys.exit(1)
-
-with open("config.yaml") as f:
-    cfg = yaml.safe_load(f)
-
-# Google Calendar client
-creds_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-credentials = service_account.Credentials.from_service_account_info(
-    creds_info,
-    scopes=["https://www.googleapis.com/auth/calendar"]
-)
-calendar_service = build("calendar","v3",credentials=credentials)
-
-# Settings
-cal        = Canada()
- tz         = pytz.timezone(cfg["timezone"])
-work_start = datetime.strptime(cfg["work_hours"]["start"],"%H:%M").time()
-work_end   = datetime.strptime(cfg["work_hours"]["end"],"%H:%M").time()
-
-# Todoist v1 base URL
-TODOIST_BASE = "https://api.todoist.com/api/v1"
-HEADERS      = {"Authorization": f"Bearer {TODOIST_TOKEN}","Content-Type":"application/json"}
-
-# OpenAI setup
-client = OpenAI(api_key=OPENAI_KEY)
-
-# Helpers
+    return PlainTextResponse("OK", status_code=200)
