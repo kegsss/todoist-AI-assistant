@@ -64,9 +64,9 @@ last_scheduler_run = datetime.min
 @app.on_event("startup")
 def register_calendar_watches():
     """
-    Register webhooks for the work calendar and Todoist item updated event
-    """
-    # Register webhook for the work calendar only (not Todoist calendar)
+    Register webhooks for the work calendar and Todoist item updates
+    """    
+    # Register webhook for your work calendar
     work_cal_id = "keagan@togetherplatform.com"
     try:
         channel_id = str(uuid.uuid4())
@@ -84,42 +84,43 @@ def register_calendar_watches():
     except Exception as e:
         print(f"⚠️ Failed to register webhook for work calendar: {str(e)}")
     
-    # Register webhook for Todoist item:updated event
-    access_token = store.get("access_token", STATIC_TOKEN)
-    if access_token:
-        try:
-            headers = {"Authorization": f"Bearer {access_token}"}
-            
-            # First, get existing webhooks to avoid duplicates
-            existing_webhooks = requests.get(
-                f"{TODOIST_BASE}/webhooks",
-                headers=headers
-            ).json()
-            
-            # Check if we already have a webhook for this URL
-            webhook_exists = False
-            for webhook in existing_webhooks:
-                if webhook.get("url") == WEBHOOK_URL:
-                    webhook_exists = True
-                    print(f"🛰️ Todoist webhook already exists: {webhook}")
-                    break
-            
-            if not webhook_exists:
-                webhook_data = {
-                    "url": WEBHOOK_URL,
-                    "event_types": ["item:updated"]
-                }
+    # Register webhook for Todoist item updates
+    try:
+        if STATIC_TOKEN:
+            headers = {"Authorization": f"Bearer {STATIC_TOKEN}"}
+            # First check if webhook already exists
+            try:
+                existing = requests.get(f"{TODOIST_BASE}/webhooks", headers=headers)
+                existing.raise_for_status()
+                existing_webhooks = existing.json()
                 
-                # Using the unified v1 API
-                resp = requests.post(
-                    f"{TODOIST_BASE}/webhooks",
-                    headers=headers,
-                    json=webhook_data
-                )
-                resp.raise_for_status()
-                print(f"🛰️ Todoist item:updated webhook registered: {resp.json()}")
-        except Exception as e:
-            print(f"⚠️ Failed to register Todoist item:updated webhook: {str(e)}")
+                # Check for existing webhook with same URL
+                webhook_exists = False
+                if isinstance(existing_webhooks, list):
+                    for webhook in existing_webhooks:
+                        if webhook.get("url") == WEBHOOK_URL:
+                            webhook_exists = True
+                            print(f"🛰️ Todoist webhook already exists: {webhook}")
+                            break
+                
+                if not webhook_exists:
+                    # Create new webhook
+                    webhook_data = {
+                        "url": WEBHOOK_URL,
+                        "event_types": ["item:updated"]
+                    }
+                    
+                    resp = requests.post(
+                        f"{TODOIST_BASE}/webhooks",
+                        headers=headers,
+                        json=webhook_data
+                    )
+                    resp.raise_for_status()
+                    print(f"🛰️ Todoist item:updated webhook registered: {resp.json()}")
+            except Exception as e:
+                print(f"⚠️ Failed to check existing webhooks: {str(e)}")
+    except Exception as e:
+        print(f"⚠️ Failed to register Todoist webhook: {str(e)}")
 
 # ── Health check ──
 @app.get("/healthz")
@@ -173,40 +174,42 @@ async def auth_callback(request: Request):
 
     store["access_token"] = token
     
-    # Register webhook for Todoist item:updated event with the new token
+    # Register webhook for Todoist item updates
     try:
         headers = {"Authorization": f"Bearer {token}"}
-        
-        # First, get existing webhooks to avoid duplicates
-        existing_webhooks = requests.get(
-            f"{TODOIST_BASE}/webhooks",
-            headers=headers
-        ).json()
-        
-        # Check if we already have a webhook for this URL
-        webhook_exists = False
-        for webhook in existing_webhooks:
-            if webhook.get("url") == WEBHOOK_URL:
-                webhook_exists = True
-                print(f"🛰️ Todoist webhook already exists: {webhook}")
-                break
-        
-        if not webhook_exists:
-            webhook_data = {
-                "url": WEBHOOK_URL,
-                "event_types": ["item:updated"]
-            }
+        # First check if webhook already exists
+        try:
+            existing = requests.get(f"{TODOIST_BASE}/webhooks", headers=headers)
+            existing.raise_for_status()
+            existing_webhooks = existing.json()
             
-            # Using the unified v1 API
-            resp = requests.post(
-                f"{TODOIST_BASE}/webhooks",
-                headers=headers,
-                json=webhook_data
-            )
-            resp.raise_for_status()
-            print(f"🛰️ Todoist item:updated webhook registered after OAuth: {resp.json()}")
+            # Check for existing webhook with same URL
+            webhook_exists = False
+            if isinstance(existing_webhooks, list):
+                for webhook in existing_webhooks:
+                    if webhook.get("url") == WEBHOOK_URL:
+                        webhook_exists = True
+                        print(f"🛰️ Todoist webhook already exists after OAuth: {webhook}")
+                        break
+            
+            if not webhook_exists:
+                # Create new webhook
+                webhook_data = {
+                    "url": WEBHOOK_URL,
+                    "event_types": ["item:updated"]
+                }
+                
+                resp = requests.post(
+                    f"{TODOIST_BASE}/webhooks",
+                    headers=headers,
+                    json=webhook_data
+                )
+                resp.raise_for_status()
+                print(f"🛰️ Todoist item:updated webhook registered after OAuth: {resp.json()}")
+        except Exception as e:
+            print(f"⚠️ Failed to check existing webhooks after OAuth: {str(e)}")
     except Exception as e:
-        print(f"⚠️ Failed to register Todoist item:updated webhook: {str(e)}")
+        print(f"⚠️ Failed to register Todoist webhook after OAuth: {str(e)}")
 
     return PlainTextResponse("✅ OAuth complete! You can close this tab.", status_code=200)
 

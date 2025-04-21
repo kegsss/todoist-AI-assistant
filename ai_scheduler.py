@@ -120,9 +120,9 @@ date_strs = [d.isoformat() for d in avail]
 def get_calendar_busy() -> dict:
     busy = {d: [] for d in avail}
     
-    # First, check the work calendar from config
+    # Check the work calendar from config
     cal_id = cfg["work_calendar_id"]
-    print(f"🔍 Checking work calendar: {cal_id}")
+    print(f"🔍 Checking calendar: {cal_id}")
     
     for d in avail:
         tmin = tz.localize(datetime.combine(d, work_start)).isoformat()
@@ -144,106 +144,10 @@ def get_calendar_busy() -> dict:
                 s = datetime.fromisoformat(sf["dateTime"]).astimezone(tz)
                 e = datetime.fromisoformat(ef["dateTime"]).astimezone(tz)
                 busy[d].append((s, e))
-                print(f"⚠️ No gap; defaulting {tid} to {due} at {pointer.time()}")
-        
-        print(f"🎯 Final for {tid}: date={due}, start={pointer.time()}, dur={dur}m")
-        
-        # Use the correct priority from AI assignment or original task
-        priority = a.get('priority')
-        
-        # Create update payload with duration and priority
-        update_payload = {
-            "due_datetime": pointer.isoformat(),
-            "duration": dur,
-            "duration_unit": "minute"
-        }
-        
-        # Only include priority if it was specified
-        if priority:
-            update_payload["priority"] = priority
-            
-        # Update the task
-        requests.post(
-            f"{TODOIST_BASE}/tasks/{tid}", 
-            headers=HEADERS,
-            json=update_payload
-        ).raise_for_status()
-        
-        dslot = date.fromisoformat(due)
-        busy_slots.setdefault(dslot, []).append((pointer, pointer + timedelta(minutes=dur)))
-        busy_slots[dslot] = merge_intervals(busy_slots[dslot])
-
-# 6) Auto-prioritize today's tasks
-resp2 = requests.get(f"{TODOIST_BASE}/tasks", headers=HEADERS, params={"project_id": cfg['project_id']})
-resp2.raise_for_status()
-data2 = resp2.json()
-if isinstance(data2, dict):
-    tasks_list2 = data2.get('results') or data2.get('items') or []
-elif isinstance(data2, list):
-    tasks_list2 = data2
-else:
-    tasks_list2 = []
-tasks_today = [
-    {"id": str(t['id']), "priority": t.get('priority', 1)}
-    for t in tasks_list2
-    if (t.get('due') or {}).get('date') == today.isoformat()
-]
-if tasks_today:
-    fn2 = make_schedule_function()
-    fn2.update({
-        "name": "set_priorities",
-        "description": "Set priority for today's tasks based on importance.",
-        "parameters": fn2['parameters']
-    })
-    msgs2 = [
-        {"role": "system", "content": "You are a productivity coach for Todoist."},
-        {"role": "user", "content": f"Rank tasks: {json.dumps(tasks_today)}"}
-    ]
-    msg2 = call_openai(msgs2, functions=[fn2], function_call={"name": fn2['name']})
-    for r in json.loads(msg2.function_call.arguments).get('tasks', []):
-        requests.post(
-            f"{TODOIST_BASE}/tasks/{r['id']}", headers=HEADERS,
-            json={"priority": r['priority']}
-        ).raise_for_status()
-    print("🔧 Updated today's priorities")
-
-print("✅ ai_scheduler complete.")📅 Found busy slot on {d}: {s.time()} to {e.time()}: {summary}")
+                print(f"📅 Found busy slot on {d}: {s.time()} to {e.time()}: {summary}")
             elif "date" in sf and "date" in ef:
                 busy[d].append((tz.localize(datetime.combine(d, work_start)), tz.localize(datetime.combine(d, work_end))))
                 print(f"📅 Found all-day event on {d}: {summary}")
-    
-    # Also check keagan@togetherplatform.com explicitly if it's different from work_calendar_id
-    if cal_id != "keagan@togetherplatform.com":
-        personal_cal_id = "keagan@togetherplatform.com"
-        print(f"🔍 Also checking personal calendar: {personal_cal_id}")
-        
-        try:
-            for d in avail:
-                tmin = tz.localize(datetime.combine(d, work_start)).isoformat()
-                tmax = tz.localize(datetime.combine(d, work_end)).isoformat()
-                resp = calendar_service.events().list(
-                    calendarId=personal_cal_id,
-                    timeMin=tmin,
-                    timeMax=tmax,
-                    singleEvents=True,
-                    orderBy="startTime"
-                ).execute()
-                events = resp.get("items", [])
-                for ev in events:
-                    summary = ev.get("summary", "")
-                    if "Focus time" in summary:
-                        continue
-                    sf = ev.get("start", {}); ef = ev.get("end", {})
-                    if "dateTime" in sf and "dateTime" in ef:
-                        s = datetime.fromisoformat(sf["dateTime"]).astimezone(tz)
-                        e = datetime.fromisoformat(ef["dateTime"]).astimezone(tz)
-                        busy[d].append((s, e))
-                        print(f"📅 Found busy slot on {d} from personal calendar: {s.time()} to {e.time()}: {summary}")
-                    elif "date" in sf and "date" in ef:
-                        busy[d].append((tz.localize(datetime.combine(d, work_start)), tz.localize(datetime.combine(d, work_end))))
-                        print(f"📅 Found all-day event on {d} from personal calendar: {summary}")
-        except Exception as e:
-            print(f"⚠️ Error accessing personal calendar: {str(e)}")
     
     return {d: merge_intervals(intervals) for d, intervals in busy.items()}
 
@@ -453,4 +357,67 @@ if tasks_to_schedule:
                 )
             else:
                 pointer = tz.localize(datetime.combine(date.fromisoformat(due), work_start))
-            print(f"
+            print(f"⚠️ No gap; defaulting {tid} to {due} at {pointer.time()}")
+        
+        print(f"🎯 Final for {tid}: date={due}, start={pointer.time()}, dur={dur}m")
+        
+        # Use the correct priority from AI assignment or original task
+        priority = a.get('priority')
+        
+        # Create update payload with duration and priority
+        update_payload = {
+            "due_datetime": pointer.isoformat(),
+            "duration": dur,
+            "duration_unit": "minute"
+        }
+        
+        # Only include priority if it was specified
+        if priority:
+            update_payload["priority"] = priority
+            
+        # Update the task
+        requests.post(
+            f"{TODOIST_BASE}/tasks/{tid}", 
+            headers=HEADERS,
+            json=update_payload
+        ).raise_for_status()
+        
+        dslot = date.fromisoformat(due)
+        busy_slots.setdefault(dslot, []).append((pointer, pointer + timedelta(minutes=dur)))
+        busy_slots[dslot] = merge_intervals(busy_slots[dslot])
+
+# 6) Auto-prioritize today's tasks
+resp2 = requests.get(f"{TODOIST_BASE}/tasks", headers=HEADERS, params={"project_id": cfg['project_id']})
+resp2.raise_for_status()
+data2 = resp2.json()
+if isinstance(data2, dict):
+    tasks_list2 = data2.get('results') or data2.get('items') or []
+elif isinstance(data2, list):
+    tasks_list2 = data2
+else:
+    tasks_list2 = []
+tasks_today = [
+    {"id": str(t['id']), "priority": t.get('priority', 1)}
+    for t in tasks_list2
+    if (t.get('due') or {}).get('date') == today.isoformat()
+]
+if tasks_today:
+    fn2 = make_schedule_function()
+    fn2.update({
+        "name": "set_priorities",
+        "description": "Set priority for today's tasks based on importance.",
+        "parameters": fn2['parameters']
+    })
+    msgs2 = [
+        {"role": "system", "content": "You are a productivity coach for Todoist."},
+        {"role": "user", "content": f"Rank tasks: {json.dumps(tasks_today)}"}
+    ]
+    msg2 = call_openai(msgs2, functions=[fn2], function_call={"name": fn2['name']})
+    for r in json.loads(msg2.function_call.arguments).get('tasks', []):
+        requests.post(
+            f"{TODOIST_BASE}/tasks/{r['id']}", headers=HEADERS,
+            json={"priority": r['priority']}
+        ).raise_for_status()
+    print("🔧 Updated today's priorities")
+
+print("✅ ai_scheduler complete.")
