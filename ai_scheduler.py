@@ -119,7 +119,11 @@ date_strs = [d.isoformat() for d in avail]
 # 1) Calendar busy slots
 def get_calendar_busy() -> dict:
     busy = {d: [] for d in avail}
+    
+    # First, check the work calendar from config
     cal_id = cfg["work_calendar_id"]
+    print(f"🔍 Checking work calendar: {cal_id}")
+    
     for d in avail:
         tmin = tz.localize(datetime.combine(d, work_start)).isoformat()
         tmax = tz.localize(datetime.combine(d, work_end)).isoformat()
@@ -140,8 +144,44 @@ def get_calendar_busy() -> dict:
                 s = datetime.fromisoformat(sf["dateTime"]).astimezone(tz)
                 e = datetime.fromisoformat(ef["dateTime"]).astimezone(tz)
                 busy[d].append((s, e))
+                print(f"📅 Found busy slot on {d}: {s.time()} to {e.time()}: {summary}")
             elif "date" in sf and "date" in ef:
                 busy[d].append((tz.localize(datetime.combine(d, work_start)), tz.localize(datetime.combine(d, work_end))))
+                print(f"📅 Found all-day event on {d}: {summary}")
+    
+    # Also check keagan@togetherplatform.com explicitly if it's different from work_calendar_id
+    if cal_id != "keagan@togetherplatform.com":
+        personal_cal_id = "keagan@togetherplatform.com"
+        print(f"🔍 Also checking personal calendar: {personal_cal_id}")
+        
+        try:
+            for d in avail:
+                tmin = tz.localize(datetime.combine(d, work_start)).isoformat()
+                tmax = tz.localize(datetime.combine(d, work_end)).isoformat()
+                resp = calendar_service.events().list(
+                    calendarId=personal_cal_id,
+                    timeMin=tmin,
+                    timeMax=tmax,
+                    singleEvents=True,
+                    orderBy="startTime"
+                ).execute()
+                events = resp.get("items", [])
+                for ev in events:
+                    summary = ev.get("summary", "")
+                    if "Focus time" in summary:
+                        continue
+                    sf = ev.get("start", {}); ef = ev.get("end", {})
+                    if "dateTime" in sf and "dateTime" in ef:
+                        s = datetime.fromisoformat(sf["dateTime"]).astimezone(tz)
+                        e = datetime.fromisoformat(ef["dateTime"]).astimezone(tz)
+                        busy[d].append((s, e))
+                        print(f"📅 Found busy slot on {d} from personal calendar: {s.time()} to {e.time()}: {summary}")
+                    elif "date" in sf and "date" in ef:
+                        busy[d].append((tz.localize(datetime.combine(d, work_start)), tz.localize(datetime.combine(d, work_end))))
+                        print(f"📅 Found all-day event on {d} from personal calendar: {summary}")
+        except Exception as e:
+            print(f"⚠️ Error accessing personal calendar: {str(e)}")
+    
     return {d: merge_intervals(intervals) for d, intervals in busy.items()}
 
 calendar_busy = get_calendar_busy()

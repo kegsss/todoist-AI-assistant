@@ -62,22 +62,41 @@ calendar_service = build("calendar", "v3", credentials=creds)
 last_scheduler_run = datetime.min
 
 @app.on_event("startup")
-def register_calendar_watch():
+def register_calendar_watches():
     """
-    Ask Google Calendar to POST us changes on your 'Todoist' calendar.
+    Register webhooks for both the Todoist calendar and work calendar
     """
-    channel_id = str(uuid.uuid4())
-    body = {
-        "id":      channel_id,
+    # Register webhook for the Todoist calendar
+    channel_id1 = str(uuid.uuid4())
+    body1 = {
+        "id":      channel_id1,
         "type":    "web_hook",
         "address": CALENDAR_WEBHOOK_URL,
         "params":  {"ttl": "86400"}
     }
-    resp = calendar_service.events().watch(
+    resp1 = calendar_service.events().watch(
         calendarId=GOOGLE_CAL_ID,
-        body=body
+        body=body1
     ).execute()
-    print("🛰️ Calendar watch registered:", resp)
+    print("🛰️ Todoist calendar watch registered:", resp1)
+    
+    # Register webhook for your work calendar
+    work_cal_id = "keagan@togetherplatform.com"
+    try:
+        channel_id2 = str(uuid.uuid4())
+        body2 = {
+            "id":      channel_id2,
+            "type":    "web_hook",
+            "address": CALENDAR_WEBHOOK_URL,
+            "params":  {"ttl": "86400"}
+        }
+        resp2 = calendar_service.events().watch(
+            calendarId=work_cal_id,
+            body=body2
+        ).execute()
+        print("🛰️ Work calendar watch registered:", resp2)
+    except Exception as e:
+        print(f"⚠️ Failed to register webhook for work calendar: {str(e)}")
 
 # ── Health check ──
 @app.get("/healthz")
@@ -192,10 +211,11 @@ async def calendar_webhook(
     req: Request,
     x_goog_channel_id: str = Header(None),
     x_goog_resource_state: str = Header(None),
+    x_goog_resource_id: str = Header(None),
 ):
     global last_scheduler_run
     
-    print(f"📬 Calendar notification: state={x_goog_resource_state}")
+    print(f"📬 Calendar notification: state={x_goog_resource_state}, resource_id={x_goog_resource_id}")
     
     # Only process notifications about changes to resources
     if x_goog_resource_state not in ["exists", "sync"]:
@@ -207,32 +227,42 @@ async def calendar_webhook(
         print("⏭️ Skipping webhook - scheduler was recently run")
         return PlainTextResponse("debounced", status_code=200)
     
+    # We'll check both the Todoist calendar and work calendar for changes
+    calendars_to_check = [
+        GOOGLE_CAL_ID,                  # Todoist calendar
+        "keagan@togetherplatform.com"   # Work calendar
+    ]
+    
     # Check for recent calendar changes (last 30 minutes)
     window_start = (current_time - timedelta(minutes=30)).isoformat() + "Z"
+    has_changes = False
     
-    try:
-        events = calendar_service.events().list(
-            calendarId=GOOGLE_CAL_ID,
-            showDeleted=False,
-            singleEvents=True,
-            updatedMin=window_start,
-            timeMin=window_start,
-            timeMax=(current_time + timedelta(days=14)).isoformat() + "Z"
-        ).execute().get("items", [])
-        
-        if events:
-            print(f"🔄 Found {len(events)} recently changed calendar events, running scheduler")
-            # Update the last run time before executing
-            last_scheduler_run = current_time
+    for calendar_id in calendars_to_check:
+        try:
+            events = calendar_service.events().list(
+                calendarId=calendar_id,
+                showDeleted=False,
+                singleEvents=True,
+                updatedMin=window_start,
+                timeMin=window_start,
+                timeMax=(current_time + timedelta(days=14)).isoformat() + "Z"
+            ).execute().get("items", [])
             
-            # Run the scheduler synchronously to prevent multiple instances
-            env = os.environ.copy()
-            env["TODOIST_API_TOKEN"] = store.get("access_token", STATIC_TOKEN)
-            subprocess.run(["python", "ai_scheduler.py"], env=env, check=True)
-            return PlainTextResponse("Scheduler completed", status_code=200)
+            if events:
+                print(f"🔄 Found {len(events)} recently changed events in {calendar_id}")
+                has_changes = True
+        except Exception as e:
+            print(f"⚠️ Error checking calendar {calendar_id}: {str(e)}")
+    
+    if has_changes:
+        print("🔄 Running scheduler to check for conflicts")
+        # Update the last run time before executing
+        last_scheduler_run = current_time
         
-        return PlainTextResponse("No relevant changes", status_code=200)
-        
-    except Exception as e:
-        print(f"❌ Error processing calendar webhook: {str(e)}")
-        return PlainTextResponse(f"Error: {str(e)}", status_code=500)
+        # Run the scheduler synchronously to prevent multiple instances
+        env = os.environ.copy()
+        env["TODOIST_API_TOKEN"] = store.get("access_token", STATIC_TOKEN)
+        subprocess.run(["python", "ai_scheduler.py"], env=env, check=True)
+        return PlainTextResponse("Scheduler completed", status_code=200)
+    
+    return PlainTextResponse("No relevant changes", status_code=200)
