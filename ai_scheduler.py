@@ -186,7 +186,7 @@ def get_unscheduled(busy_calendar: dict) -> list:
 
 unscheduled = get_unscheduled(calendar_busy)
 
-# 3) Build full busy slots
+# 3) Build full busy slots including tasks
 busy_slots = dict(calendar_busy)
 r_all = requests.get(f"{TODOIST_BASE}/tasks", headers=HEADERS, params={"project_id": cfg["project_id"]})
 r_all.raise_for_status()
@@ -236,7 +236,11 @@ if unscheduled:
         pointer    = None
         for dd in candidates:
             ddate = date.fromisoformat(dd)
-            ptr   = tz.localize(datetime.combine(ddate, work_start))
+            # compute start pointer: after now for today, else work_start
+            start_base = tz.localize(datetime.combine(ddate, work_start))
+            if ddate == today:
+                start_base = max(start_base, now + timedelta(minutes=BUFFER))
+            ptr = start_base
             for bs, be in busy_slots.get(ddate, []):
                 if ptr + timedelta(minutes=dur) <= bs - timedelta(minutes=BUFFER):
                     break
@@ -247,7 +251,8 @@ if unscheduled:
                 break
         if pointer is None:
             due     = date_strs[0]
-            pointer = tz.localize(datetime.combine(date.fromisoformat(due), work_start))
+            fallback = tz.localize(datetime.combine(date.fromisoformat(due), work_start))
+            pointer = max(fallback, now + timedelta(minutes=BUFFER)) if date.fromisoformat(due) == today else fallback
             print(f"⚠️ No gap; defaulting {tid} to {due} at {pointer.time()}")
         print(f"🎯 Final for {tid}: date={due}, start={pointer.time()}, dur={dur}m")
         requests.post(
