@@ -17,7 +17,7 @@ app = FastAPI()
 CLIENT_ID            = os.getenv("TODOIST_CLIENT_ID")
 CLIENT_SECRET        = os.getenv("TODOIST_CLIENT_SECRET")
 REDIRECT_URI         = os.getenv("OAUTH_REDIRECT_URI")    # must match your Todoist app settings
-WEBHOOK_URL          = os.getenv("WEBHOOK_URL")           # e.g. https://…/webhook
+WEBHOOK_URL          = os.getenv("WEBHOOK_URL")           # e.g. https://…/webhook (set up in Todoist App Console)
 STATIC_TOKEN         = os.getenv("TODOIST_API_TOKEN")     # fallback for ai_scheduler
 GOOGLE_CAL_JSON      = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 GOOGLE_CAL_ID        = os.getenv("GOOGLE_CALENDAR_ID")
@@ -125,31 +125,10 @@ async def auth_callback(request: Request):
 
     store["access_token"] = token
 
-    # subscribe to your project's webhooks via unified API v1
-    try:
-        subscribe_to_webhook(token, WEBHOOK_URL)
-    except Exception as e:
-        print("⚠️ Webhook subscription failed:", e)
+    # Note: Todoist webhooks must be activated manually in the App Management Console
+    print("⚠️ Remember to enable Webhooks for your app at https://todoist.com/appconsole")
 
     return PlainTextResponse("✅ OAuth complete! You can close this tab.", status_code=200)
-
-def subscribe_to_webhook(access_token: str, webhook_url: str):
-    """
-    Register /webhook for item:added, item:completed, item:deleted on your project,
-    using the unified API v1 webhooks endpoint.
-    """
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type":  "application/json"
-    }
-    payload = {"url": webhook_url}
-    resp = requests.post(
-        f"{TODOIST_BASE}/webhooks",
-        headers=headers,
-        json=payload,
-    )
-    resp.raise_for_status()
-    print("✅ Subscribed to Todoist webhooks (v1):", resp.json())
 
 # ── Todoist validation ping ──
 @app.get("/webhook")
