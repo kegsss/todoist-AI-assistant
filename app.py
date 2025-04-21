@@ -28,7 +28,7 @@ PROJECT_ID = os.getenv("PROJECT_ID")  # your Todoist project ID (string)        
 # Base URL for unified Todoist API v1
 TODOIST_BASE = "https://api.todoist.com/api/v1"
 
-# validate that nothing’s missing
+# validate that nothing's missing
 required = {
     "TODOIST_CLIENT_ID": CLIENT_ID,
     "TODOIST_CLIENT_SECRET": CLIENT_SECRET,
@@ -190,25 +190,54 @@ async def calendar_webhook(
     x_goog_resource_state: str = Header(None),
 ):
     print(f"📬 Calendar notification: state={x_goog_resource_state}")
-    # only handle “exists” (changed) pushes
-    if x_goog_resource_state != "exists":
+    
+    # Only process notifications about changes to resources
+    if x_goog_resource_state not in ["exists", "sync"]:
         return PlainTextResponse("ignored", status_code=200)
+    
+    # Check for recent calendar changes (last 30 minutes)
+    window_start = (datetime.utcnow() - timedelta(minutes=30)).isoformat() + "Z"
+    now = datetime.utcnow().isoformat() + "Z"
+    
+    try:
+        events = calendar_service.events().list(
+            calendarId=GOOGLE_CAL_ID,
+            showDeleted=False,
+            singleEvents=True,
+            updatedMin=window_start,  # Only get events updated recently
+            timeMin=window_start,
+            timeMax=(datetime.utcnow() + timedelta(days=14)).isoformat() + "Z"  # Look ahead 2 weeks
+        ).execute().get("items", [])
+        
+        if events:
+            print(f"🔄 Found {len(events)} recently changed calendar events, running scheduler to check for conflicts")
+            # Run the scheduler to handle any conflicts with tasks
+            env = os.environ.copy()
+            env["TODOIST_API_TOKEN"] = store.get("access_token", STATIC_TOKEN)
+            subprocess.Popen(["python", "ai_scheduler.py"], env=env)
+            return PlainTextResponse("Scheduler triggered", status_code=200)
+        
+        # Also check for tasks that may have been missed (old code preserved)
+        events_ending = calendar_service.events().list(
+            calendarId=GOOGLE_CAL_ID,
+            showDeleted=False,
+            singleEvents=True,
+            timeMin=window_start,
+            timeMax=now
+        ).execute().get("items", [])
 
-    window_start = (datetime.utcnow() - timedelta(minutes=5)).isoformat() + "Z"
-    now          = datetime.utcnow().isoformat() + "Z"
-    events = calendar_service.events().list(
-        calendarId=GOOGLE_CAL_ID,
-        showDeleted=False,
-        singleEvents=True,
-        timeMin=window_start,
-        timeMax=now
-    ).execute().get("items", [])
-
-    for ev in events:
-        summary = ev.get("summary", "")
-        if summary.startswith("[") and not summary.startswith("✓"):
-            tid = summary[1:summary.index("]")]
-            print(f"⚠️ Task {tid} slot ended but not done; re‑queuing…")
-            subprocess.Popen(["python", "ai_scheduler.py"])
-
-    return PlainTextResponse("OK", status_code=200)
+        for ev in events_ending:
+            summary = ev.get("summary", "")
+            if summary.startswith("[") and not summary.startswith("✓"):
+                tid = summary[1:summary.index("]")]
+                print(f"⚠️ Task {tid} slot ended but not done; re‑queuing…")
+                env = os.environ.copy()
+                env["TODOIST_API_TOKEN"] = store.get("access_token", STATIC_TOKEN)
+                subprocess.Popen(["python", "ai_scheduler.py"], env=env)
+                return PlainTextResponse("Scheduler triggered for missed task", status_code=200)
+        
+        return PlainTextResponse("No relevant changes", status_code=200)
+        
+    except Exception as e:
+        print(f"❌ Error processing calendar webhook: {str(e)}")
+        return PlainTextResponse(f"Error: {str(e)}", status_code=500)

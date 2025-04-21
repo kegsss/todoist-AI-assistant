@@ -176,17 +176,29 @@ def get_tasks_needing_scheduling(busy_calendar: dict) -> list:
         # Check if task is overdue or conflicts with calendar
         if dt:
             start = datetime.fromisoformat(dt).astimezone(tz)
+            # Skip if task is in the past AND already completed
+            if start < now and (t.get("checked") or t.get("completed_at")):
+                continue
+                
             # Check if task is in the past
             if start < now:
                 print(f"⚠️ Overdue task found: {t.get('content')} was due at {start.isoformat()}")
                 needs_update = True
             else:
                 # Check if task conflicts with calendar events
-                for bs, be in busy_calendar.get(start.date(), []):
-                    if bs < start < be:
-                        print(f"⚠️ Task conflict: {t.get('content')} at {start.isoformat()} conflicts with calendar")
-                        needs_update = True
-                        break
+                task_date = start.date()
+                if task_date in busy_calendar:
+                    # Get task duration - default to config if not specified
+                    duration_minutes = t.get("duration") or cfg.get("default_task_duration_minutes", 60)
+                    end_time = start + timedelta(minutes=duration_minutes)
+                    
+                    # Check for conflicts with busy calendar slots
+                    for bs, be in busy_calendar.get(task_date, []):
+                        # Check for any overlap between task and busy slot
+                        if (bs <= start < be) or (bs < end_time <= be) or (start <= bs and end_time >= be):
+                            print(f"⚠️ Task conflict: {t.get('content')} at {start.isoformat()} conflicts with calendar event")
+                            needs_update = True
+                            break
         else:
             # No due date set
             needs_update = True
