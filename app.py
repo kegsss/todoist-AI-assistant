@@ -22,7 +22,8 @@ STATIC_TOKEN         = os.getenv("TODOIST_API_TOKEN")     # fallback for ai_sche
 GOOGLE_CAL_JSON      = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 GOOGLE_CAL_ID        = os.getenv("GOOGLE_CALENDAR_ID")
 CALENDAR_WEBHOOK_URL = os.getenv("CALENDAR_WEBHOOK_URL")  # e.g. https://…/calendar/webhook
-PROJECT_ID           = os.getenv("PROJECT_ID")           # your Todoist project ID
+# For webhooks, use the string Project ID (from Todoist payload), set this to e.g. "6Xp2pfmF8wCWr3Gf"
+PROJECT_ID = os.getenv("PROJECT_ID")  # your Todoist project ID (string)           # your Todoist project ID
 
 # Base URL for unified Todoist API v1
 TODOIST_BASE = "https://api.todoist.com/api/v1"
@@ -43,7 +44,8 @@ missing = [k for k,v in required.items() if not v]
 if missing:
     raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
 
-PROJECT_ID = int(PROJECT_ID)
+# Keep PROJECT_ID as string for webhook comparisons
+# PROJECT_ID = int(PROJECT_ID)  # removed to allow string based matching
 
 # ── In‑memory OAuth store ──
 store = {}
