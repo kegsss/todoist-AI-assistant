@@ -146,8 +146,8 @@ def get_calendar_busy() -> dict:
 
 calendar_busy = get_calendar_busy()
 
-# 2) Identify unscheduled/conflicted tasks
-def get_unscheduled(busy_calendar: dict) -> list:
+# 2) Identify unscheduled/conflicted/overdue tasks
+def get_tasks_needing_scheduling(busy_calendar: dict) -> list:
     r = requests.get(f"{TODOIST_BASE}/tasks", headers=HEADERS, params={"project_id": cfg["project_id"]})
     r.raise_for_status()
     data = r.json()
@@ -157,36 +157,60 @@ def get_unscheduled(busy_calendar: dict) -> list:
         tasks_raw = data
     else:
         tasks_raw = []
-    unsched = []
+    
+    needs_scheduling = []
     for t in tasks_raw:
         if not isinstance(t, dict):
             continue
-        if t.get("recurring"): continue
+        if t.get("recurring"): 
+            continue
+        if t.get("checked") or t.get("completed_at"):
+            continue
+            
         due = t.get("due") or {}
-        dt  = due.get("dateTime")
-        d   = due.get("date")
+        dt = due.get("dateTime")
+        d = due.get("date")
         tid = str(t.get("id"))
-        conflict = False
+        needs_update = False
+        
+        # Check if task is overdue or conflicts with calendar
         if dt:
             start = datetime.fromisoformat(dt).astimezone(tz)
+            # Check if task is in the past
             if start < now:
-                conflict = True
+                print(f"⚠️ Overdue task found: {t.get('content')} was due at {start.isoformat()}")
+                needs_update = True
             else:
+                # Check if task conflicts with calendar events
                 for bs, be in busy_calendar.get(start.date(), []):
                     if bs < start < be:
-                        conflict = True; break
-        elif d:
-            continue
+                        print(f"⚠️ Task conflict: {t.get('content')} at {start.isoformat()} conflicts with calendar")
+                        needs_update = True
+                        break
         else:
-            conflict = True
-        if conflict:
-            requests.post(f"{TODOIST_BASE}/tasks/{tid}", headers=HEADERS, json={"due_date": None, "due_datetime": None}).raise_for_status()
-            unsched.append({"id": tid, "content": t.get("content", ""), "priority": t.get("priority", 4), "created_at": t.get("created_at")})
-    return unsched
+            # No due date set
+            needs_update = True
+            
+        if needs_update:
+            # Clear the current due date/time
+            requests.post(
+                f"{TODOIST_BASE}/tasks/{tid}", 
+                headers=HEADERS, 
+                json={"due_date": None, "due_datetime": None}
+            ).raise_for_status()
+            
+            needs_scheduling.append({
+                "id": tid, 
+                "content": t.get("content", ""), 
+                "priority": t.get("priority", 4), 
+                "created_at": t.get("created_at")
+            })
+    
+    return needs_scheduling
 
-unscheduled = get_unscheduled(calendar_busy)
+tasks_to_schedule = get_tasks_needing_scheduling(calendar_busy)
 
-# 3) Build full busy slots including tasks
+# 3) Build full busy slots
 busy_slots = dict(calendar_busy)
 r_all = requests.get(f"{TODOIST_BASE}/tasks", headers=HEADERS, params={"project_id": cfg["project_id"]})
 r_all.raise_for_status()
@@ -194,71 +218,98 @@ all_tasks = r_all.json()
 for t in all_tasks:
     if not isinstance(t, dict): continue
     due = t.get("due") or {}
-    dt  = due.get("dateTime")
+    dt = due.get("dateTime")
     if dt:
         start = datetime.fromisoformat(dt).astimezone(tz)
-        dur   = t.get("duration") or cfg.get("default_task_duration_minutes", 60)
-        end   = start + timedelta(minutes=dur)
+        dur = t.get("duration") or cfg.get("default_task_duration_minutes", 60)
+        end = start + timedelta(minutes=dur)
         busy_slots.setdefault(start.date(), []).append((start, end))
 for d in busy_slots:
     busy_slots[d] = merge_intervals(busy_slots[d])
 
 # 4) Priority decay
 BUFFER = cfg.get("buffer_minutes", 5)
-for task in unscheduled:
-    orig    = task["priority"]
+for task in tasks_to_schedule:
+    orig = task["priority"]
     created = task.get("created_at")
     if created:
-        c        = date.fromisoformat(created[:10])
-        decay    = max(0, (today - c).days) * cfg.get("priority_decay_per_day", 1)
+        c = date.fromisoformat(created[:10])
+        decay = max(0, (today - c).days) * cfg.get("priority_decay_per_day", 1)
         new_prio = max(1, orig - decay)
         if new_prio != orig:
             print(f"⚠️ Decay {task['id']}: {orig}->{new_prio}")
             task["priority"] = new_prio
 
 # 5) AI assignment & scheduling
-if unscheduled:
-    tasks_list = [{"id": t['id'], "priority": t['priority']} for t in unscheduled]
+if tasks_to_schedule:
+    tasks_list = [{"id": t['id'], "priority": t['priority']} for t in tasks_to_schedule]
     msgs = [
         {"role": "system", "content": "You are an AI scheduling tasks within work hours."},
         {"role": "user", "content": f"Dates: {date_strs}\nTasks: {json.dumps(tasks_list)}\nMax/day: {cfg['max_tasks_per_day']}"}
     ]
-    res     = call_openai(msgs, functions=[make_schedule_function()], function_call={"name": "assign_due_dates"})
+    res = call_openai(msgs, functions=[make_schedule_function()], function_call={"name": "assign_due_dates"})
     assigns = json.loads(res.function_call.arguments).get("tasks", [])
     print("🧠 AI raw assignments:")
     for a in assigns:
         print(f"  - {a}")
+    
+    # Block out current time as busy
+    current_time_buffer = timedelta(minutes=15)  # Buffer to ensure new tasks aren't scheduled too soon
+    current_date = now.date()
+    if current_date in busy_slots:
+        # Add the current time as busy to prevent scheduling in the past
+        current_busy = (now - current_time_buffer, now + current_time_buffer)
+        busy_slots[current_date].append(current_busy)
+        busy_slots[current_date] = merge_intervals(busy_slots[current_date])
+    
     for a in assigns:
-        tid        = a['id']
-        dur        = a.get('duration_minutes', cfg.get('default_task_duration_minutes', 60))
-        due_input  = a.get('due_date') or ''
+        tid = a['id']
+        dur = a.get('duration_minutes', cfg.get('default_task_duration_minutes', 60))
+        due_input = a.get('due_date') or ''
         candidates = [due_input] if due_input in date_strs else date_strs
-        pointer    = None
+        pointer = None
+        
         for dd in candidates:
             ddate = date.fromisoformat(dd)
-            # compute start pointer: after now for today, else work_start
-            start_base = tz.localize(datetime.combine(ddate, work_start))
+            
+            # If scheduling for today, start from current time + buffer instead of work_start
             if ddate == today:
-                start_base = max(start_base, now + timedelta(minutes=BUFFER))
-            ptr = start_base
+                ptr = max(
+                    tz.localize(datetime.combine(ddate, work_start)),
+                    now + timedelta(minutes=10)  # Add a 10-minute buffer from now
+                )
+            else:
+                ptr = tz.localize(datetime.combine(ddate, work_start))
+            
             for bs, be in busy_slots.get(ddate, []):
                 if ptr + timedelta(minutes=dur) <= bs - timedelta(minutes=BUFFER):
                     break
                 ptr = max(ptr, be + timedelta(minutes=BUFFER))
+            
             if ptr + timedelta(minutes=dur) <= tz.localize(datetime.combine(ddate, work_end)):
-                due     = dd
+                due = dd
                 pointer = ptr
                 break
+        
         if pointer is None:
-            due     = date_strs[0]
-            fallback = tz.localize(datetime.combine(date.fromisoformat(due), work_start))
-            pointer = max(fallback, now + timedelta(minutes=BUFFER)) if date.fromisoformat(due) == today else fallback
+            # If no suitable time was found in any of the available dates
+            due = date_strs[0]
+            if date.fromisoformat(due) == today:
+                # For today, start from current time + buffer
+                pointer = max(
+                    tz.localize(datetime.combine(date.fromisoformat(due), work_start)),
+                    now + timedelta(minutes=10)
+                )
+            else:
+                pointer = tz.localize(datetime.combine(date.fromisoformat(due), work_start))
             print(f"⚠️ No gap; defaulting {tid} to {due} at {pointer.time()}")
+        
         print(f"🎯 Final for {tid}: date={due}, start={pointer.time()}, dur={dur}m")
         requests.post(
             f"{TODOIST_BASE}/tasks/{tid}", headers=HEADERS,
             json={"due_datetime": pointer.isoformat(), "duration": dur, "duration_unit": "minute"}
         ).raise_for_status()
+        
         dslot = date.fromisoformat(due)
         busy_slots.setdefault(dslot, []).append((pointer, pointer + timedelta(minutes=dur)))
         busy_slots[dslot] = merge_intervals(busy_slots[dslot])
