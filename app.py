@@ -24,6 +24,9 @@ GOOGLE_CAL_ID        = os.getenv("GOOGLE_CALENDAR_ID")
 CALENDAR_WEBHOOK_URL = os.getenv("CALENDAR_WEBHOOK_URL")  # e.g. https://…/calendar/webhook
 PROJECT_ID           = os.getenv("PROJECT_ID")           # your Todoist project ID
 
+# Base URL for unified Todoist API v1
+TODOIST_BASE = "https://api.todoist.com/api/v1"
+
 # validate that nothing’s missing
 required = {
     "TODOIST_CLIENT_ID": CLIENT_ID,
@@ -122,7 +125,7 @@ async def auth_callback(request: Request):
 
     store["access_token"] = token
 
-    # subscribe to your project's webhooks via unified v1 sync
+    # subscribe to your project's webhooks via unified API v1
     try:
         subscribe_to_webhook(token, WEBHOOK_URL)
     except Exception as e:
@@ -133,17 +136,16 @@ async def auth_callback(request: Request):
 def subscribe_to_webhook(access_token: str, webhook_url: str):
     """
     Register /webhook for item:added, item:completed, item:deleted on your project,
-    using the unified v1 sync endpoint.
+    using the unified API v1 webhooks endpoint.
     """
-    payload = {
-        "sync_token":     "*",
-        "resource_types": ["item:added", "item:completed", "item:deleted"],
-        "webhook_url":    webhook_url,
-        "project_id":     PROJECT_ID
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type":  "application/json"
     }
+    payload = {"url": webhook_url}
     resp = requests.post(
-        "https://api.todoist.com/api/v1/sync",
-        headers={"Authorization": f"Bearer {access_token}"},
+        f"{TODOIST_BASE}/webhooks",
+        headers=headers,
         json=payload,
     )
     resp.raise_for_status()
