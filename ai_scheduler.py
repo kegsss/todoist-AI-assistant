@@ -46,7 +46,7 @@ work_end   = datetime.strptime(cfg["work_hours"]["end"],   "%H:%M").time()
 TODOIST_BASE = "https://api.todoist.com/api/v1"
 HEADERS      = {
     "Authorization": f"Bearer {TODOIST_TOKEN}",
-    "Content-Type": "application/json"
+    "Content-Type":  "application/json"
 }
 
 # —— OpenAI client setup ——
@@ -122,13 +122,13 @@ def get_unscheduled_tasks():
         params={"project_id": cfg["project_id"]}
     )
     resp.raise_for_status()
-    tasks = resp.json()
+    data = resp.json()
+    tasks = data.get("results", [])
     unscheduled = []
     for t in tasks:
-        due = t.get("due") or {}
-        due_date = due.get("date")
-        # include only non-recurring tasks with no due date or overdue
-        if not t.get("recurring", False) and (not due_date or due_date < today.isoformat()):
+        due_info = t.get("due") or {}
+        due_date = due_info.get("date")
+        if not t.get("recurring", False) and (due_date is None or due_date < today.isoformat()):
             unscheduled.append({
                 "id":         str(t["id"]),
                 "content":    t.get("content", ""),
@@ -139,8 +139,8 @@ def get_unscheduled_tasks():
 
 BUFFER_MIN    = cfg.get('buffer_minutes', 5)
 DECAY_PER_DAY = cfg.get('priority_decay_per_day', 1)
+unscheduled   = get_unscheduled_tasks()
 
-unscheduled = get_unscheduled_tasks()
 # apply priority decay
 for task in unscheduled:
     orig     = task['priority']
@@ -160,7 +160,7 @@ if unscheduled:
     fn = make_schedule_function()
     messages = [
         {"role": "system", "content": "You are an AI scheduling tasks in Todoist. Assign each task a due_date and duration_minutes using only the provided work dates."},
-        {"role": "user", "content": (
+        {"role": "user",   "content": (
             f"Available dates: {date_strs}\n"
             f"Tasks (id, priority): {json.dumps([{ 'id': t['id'], 'priority': t['priority'] } for t in unscheduled], indent=2)}\n"
             f"Max {cfg['max_tasks_per_day']} tasks per date."
@@ -201,15 +201,14 @@ if unscheduled:
 
         print(f"🗓 Scheduling {item['id']} ('{item['content']}') "
               f"priority={item['priority']} on {due} "
-              f"{start_dt.time()}–{end_dt.time()} for {item['duration_minutes']} min (buffer={BUFFER_MIN} min)")
+              f"{start_dt.time()}–{end_dt.time()} for {item['duration_minutes']} min (buffer={BUFFER_MIN} min)")
 
-        # update Todoist due_datetime via unified API v1
-        resp = requests.post(
+        # update Todoist due_datetime
+        requests.post(
             f"{TODOIST_BASE}/tasks/{item['id']}",
             headers=HEADERS,
             json={"due_datetime": start_dt.isoformat()}
-        )
-        resp.raise_for_status()
+        ).raise_for_status()
 
         # create calendar event
         event = {
@@ -229,16 +228,13 @@ resp = requests.get(
     params={"project_id": cfg["project_id"]}
 )
 resp.raise_for_status()
-tasks_today = []
-for t in resp.json():
-    due = t.get('due') or {}
-    due_date = due.get('date')
-    if due_date and due_date <= today.isoformat():
-        tasks_today.append({
-            "id": str(t["id"]),
-            "content": t.get("content", ""),
-            "due": due_date
-        })
+data_today = resp.json()
+tasks_list = data_today.get("results", [])
+tasks_today = [
+    {"id": str(t["id"]), "content": t.get("content", ""), "due": (t.get("due") or {}).get("date")}
+    for t in tasks_list
+    if (t.get("due") or {}).get("date") <= today.isoformat()
+]
 
 if tasks_today:
     fn2 = {
@@ -264,18 +260,16 @@ if tasks_today:
     }
     messages2 = [
         {"role": "system", "content": "You are a productivity coach for Todoist."},
-        {"role": "user", "content": (
-            f"Rank these tasks by importance for today:\n{json.dumps(tasks_today, indent=2)}\n"
-            "Return JSON with 'tasks': [{id, priority}]."
+        {"role": "user",   "content": (
+            f"Rank these tasks by importance for today:\n{json.dumps(tasks_today, indent=2)}\nReturn JSON with 'tasks': [{id, priority}]."
         )}
     ]
     msg2 = call_openai(messages2, functions=[fn2], function_call={"name": fn2["name"]})
     for r in json.loads(msg2.function_call.arguments)["tasks"]:
-        resp = requests.post(
+        requests.post(
             f"{TODOIST_BASE}/tasks/{r['id']}",
             headers=HEADERS,
             json={"priority": r['priority']}
-        )
-        resp.raise_for_status()
+        ).raise_for_status()
 
 print("✅ Scheduler run complete.")
