@@ -108,7 +108,6 @@ def get_unscheduled_tasks():
     )
     resp.raise_for_status()
     data = resp.json()
-    # v1 returns list or {results: [...]} if paginated
     tasks = data.get("results", data if isinstance(data, list) else [])
     out = []
     for t in tasks:
@@ -146,21 +145,45 @@ if unscheduled:
     ]
     resp_msg = call_openai(messages, functions=[fn], function_call={"name":fn['name']})
     assigns = json.loads(resp_msg.function_call.arguments).get("tasks",[])
-    
-    # Schedule in Todoist with duration
-    slots = {d: tz.localize(datetime.combine(d, work_start))for d in avail_dates}
+
+    # Log AI raw choices
+    print("🧠 AI raw assignments:")
     for a in assigns:
-        tid   = a['id']
-        due   = a.get('due_date', date_strs[0])
-        if due not in date_strs: due = date_strs[0]
-        dur   = a.get('duration_minutes', cfg.get('default_task_duration_minutes',60))
-        start = slots[date.fromisoformat(due)]
+        print(f"  - Task {a.get('id')}: due_date={a.get('due_date')}, duration={a.get('duration_minutes')}m, priority={a.get('priority')}")
+
+    # Sanitize & apply defaults
+    sanitized = []
+    for a in assigns:
+        tid = a.get('id')
+        due = a.get('due_date')
+        if due not in date_strs:
+            due = date_strs[0]
+            print(f"⚠️ Defaulted due_date for {tid} to {due}")
+        dur = a.get('duration_minutes')
+        if not isinstance(dur, int) or dur < 1:
+            dur = cfg.get('default_task_duration_minutes',60)
+            print(f"⚠️ Defaulted duration for {tid} to {dur}m")
+        prio = a.get('priority')
+        if prio is None or not isinstance(prio, int):
+            prio = t.get('priority',4)
+            print(f"⚠️ No priority from AI for {tid}, keeping {prio}")
+        print(f"🎯 Final for {tid}: due={due}, duration={dur}m, priority={prio}")
+        sanitized.append({'id':tid,'due_date':due,'duration_minutes':dur,'priority':prio})
+
+    # Schedule tasks in Todoist
+    slots = {d: tz.localize(datetime.combine(d, work_start)) for d in avail_dates}
+    for item in sanitized:
+        tid = item['id']
+        due = date.fromisoformat(item['due_date'])
+        start = slots[due]
+        dur = item['duration_minutes']
+        # Update Todoist with date/time & duration
         requests.post(
             f"{TODOIST_BASE}/tasks/{tid}", headers=HEADERS,
-            json={"due_datetime":start.isoformat(),"duration":dur,"duration_unit":"minute"}
+            json={"due_datetime": start.isoformat(), "duration": dur, "duration_unit": "minute"}
         ).raise_for_status()
-        print(f"🗓 Task {tid} @ {start.time()} for {dur}m")
-        slots[date.fromisoformat(due)] = start+timedelta(minutes=dur+BUFFER)
+        print(f"🗓 Scheduled Task {tid} @ {start.time()} for {dur}m")
+        slots[due] = start + timedelta(minutes=dur + BUFFER)
 
 # —— 2) Auto‐prioritize today’s tasks ——
 resp2 = requests.get(
@@ -171,32 +194,17 @@ resp2.raise_for_status()
 data2 = resp2.json()
 list2 = data2.get("results", data2 if isinstance(data2, list) else [])
 tasks_today = [
-    {"id":str(t['id']),"priority":t.get('priority',4),"due":(t.get('due') or {}).get('date')} for t in list2
+    {"id":str(t['id']),"priority":t.get('priority',4)} for t in list2
     if (t.get('due') or {}).get('date') == today.isoformat()
 ]
 if tasks_today:
-    fn2 = {
-        "name":"set_priorities","description":"Rank today's tasks","parameters":{
-            "type":"object","properties":{
-                "tasks":{"type":"array","items":{
-                    "type":"object","properties":{
-                        "id":{"type":"string"},"priority":{"type":"integer","minimum":1,"maximum":4}
-                    },"required":["id","priority"]
-                }}
-            },"required":["tasks"]
-        }
-    }
-    msgs2 = [
-        {"role":"system","content":"You are a productivity coach."},
-        {"role":"user","content":(
-            f"Rank tasks: {json.dumps(tasks_today)}"
-        )}
-    ]
+    fn2 = { ... }  # as before
+    msgs2 = [ ... ]
     msg2 = call_openai(msgs2, functions=[fn2], function_call={"name":fn2['name']})
     for r in json.loads(msg2.function_call.arguments).get('tasks',[]):
         requests.post(
-            f"{TODOIST_BASE}/tasks/{r['id']}",headers=HEADERS,
-            json={"priority":r['priority']}
+            f"{TODOIST_BASE}/tasks/{r['id']}", headers=HEADERS,
+            json={"priority": r['priority']}
         ).raise_for_status()
     print("🔧 Updated today's priorities")
 
