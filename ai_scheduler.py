@@ -133,7 +133,7 @@ def get_calendar_busy() -> dict:
         events = resp.get("items", [])
         for ev in events:
             summary = ev.get("summary", "")
-            if "Focus Time" in summary:
+            if "Focus time" in summary:
                 continue
             sf = ev.get("start", {}); ef = ev.get("end", {})
             if "dateTime" in sf and "dateTime" in ef:
