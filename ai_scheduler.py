@@ -219,9 +219,8 @@ if unscheduled:
         requests.post(
             f"{TODOIST_BASE}/tasks/{tid}", headers=HEADERS,
             json={
-                "due_date":      pointer.date().isoformat(),
-                "due_datetime":  pointer.isoformat(),
-                "duration":      dur,
+                "due_datetime": pointer.isoformat(),
+                "duration": dur,
                 "duration_unit": "minute"
             }
         ).raise_for_status()
