@@ -1,272 +1,456 @@
 #!/usr/bin/env python3
 import os
+import sys
 import json
-import subprocess
-import uuid
-import time
-from datetime import datetime, timedelta
-
+import yaml
+import pytz
 import requests
-from fastapi import FastAPI, Request, Header, HTTPException
-from fastapi.responses import RedirectResponse, PlainTextResponse
+from datetime import datetime, timedelta, date
+from dotenv import load_dotenv
+import openai
+from openai import OpenAI
+from tenacity import retry, stop_after_attempt, wait_exponential
+from workalendar.america import Canada
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-app = FastAPI()
+# —— Load environment & config ——
+load_dotenv()
+OPENAI_KEY                  = os.getenv("OPENAI_API_KEY")
+TODOIST_TOKEN               = os.getenv("TODOIST_API_TOKEN")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+GOOGLE_CALENDAR_ID          = os.getenv("GOOGLE_CALENDAR_ID")
 
-# ── Configuration ──
-CLIENT_ID            = os.getenv("TODOIST_CLIENT_ID")
-CLIENT_SECRET        = os.getenv("TODOIST_CLIENT_SECRET")
-REDIRECT_URI         = os.getenv("OAUTH_REDIRECT_URI")    # must match your Todoist app settings
-WEBHOOK_URL          = os.getenv("WEBHOOK_URL")           # e.g. https://…/webhook (set up in Todoist App Console)
-STATIC_TOKEN         = os.getenv("TODOIST_API_TOKEN")     # fallback for ai_scheduler
-GOOGLE_CAL_JSON      = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-GOOGLE_CAL_ID        = os.getenv("GOOGLE_CALENDAR_ID")
-CALENDAR_WEBHOOK_URL = os.getenv("CALENDAR_WEBHOOK_URL")  # e.g. https://…/calendar/webhook
-# For webhooks, use the string Project ID (from Todoist payload), set this to e.g. "6Xp2pfmF8wCWr3Gf"
-PROJECT_ID = os.getenv("PROJECT_ID")  # your Todoist project ID (string)           # your Todoist project ID
+if not (OPENAI_KEY and TODOIST_TOKEN and GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_CALENDAR_ID):
+    print("⚠️ Missing required env vars: OPENAI_API_KEY, TODOIST_API_TOKEN, GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_CALENDAR_ID")
+    sys.exit(1)
 
-# Base URL for unified Todoist API v1
+# Load config.yaml
+with open("config.yaml", "r") as f:
+    cfg = yaml.safe_load(f)
+if "work_calendar_id" not in cfg:
+    print("⚠️ Missing 'work_calendar_id' in config.yaml")
+    sys.exit(1)
+
+# —— Work‐hours & Holidays ——
+cal = Canada()
+tz = pytz.timezone(cfg["timezone"])
+work_start = datetime.strptime(cfg["work_hours"]["start"], "%H:%M").time()
+work_end   = datetime.strptime(cfg["work_hours"]["end"], "%H:%M").time()
+
+# —— API Clients ——
 TODOIST_BASE = "https://api.todoist.com/api/v1"
-
-# validate that nothing's missing
-required = {
-    "TODOIST_CLIENT_ID": CLIENT_ID,
-    "TODOIST_CLIENT_SECRET": CLIENT_SECRET,
-    "OAUTH_REDIRECT_URI": REDIRECT_URI,
-    "WEBHOOK_URL": WEBHOOK_URL,
-    "TODOIST_API_TOKEN": STATIC_TOKEN,
-    "GOOGLE_SERVICE_ACCOUNT_JSON": GOOGLE_CAL_JSON,
-    "GOOGLE_CALENDAR_ID": GOOGLE_CAL_ID,
-    "CALENDAR_WEBHOOK_URL": CALENDAR_WEBHOOK_URL,
-    "PROJECT_ID": PROJECT_ID,
-}
-missing = [k for k,v in required.items() if not v]
-if missing:
-    raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
-
-# Keep PROJECT_ID as string for webhook comparisons
-# PROJECT_ID = int(PROJECT_ID)  # removed to allow string based matching
-
-# ── In‑memory OAuth store ──
-store = {}
-
-# ── Initialize Google Calendar client ──
-creds_info = json.loads(GOOGLE_CAL_JSON)
-creds = service_account.Credentials.from_service_account_info(
-    creds_info, scopes=["https://www.googleapis.com/auth/calendar"]
-)
+HEADERS      = {"Authorization": f"Bearer {TODOIST_TOKEN}", "Content-Type": "application/json"}
+creds_info   = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+creds        = service_account.Credentials.from_service_account_info(creds_info, scopes=["https://www.googleapis.com/auth/calendar"])
 calendar_service = build("calendar", "v3", credentials=creds)
+client       = OpenAI(api_key=OPENAI_KEY)
 
-# Track the last time the scheduler was run to debounce frequent calls
-last_scheduler_run = datetime.min
+# —— Helpers ——
+def is_working_day(d: date) -> bool:
+    return d.weekday() < 5 and cal.is_working_day(d)
 
-@app.on_event("startup")
-def register_calendar_watches():
-    """
-    Register webhooks for the work calendar and Todoist item updated event
-    """
-    # Register webhook for the work calendar only (not Todoist calendar)
-    work_cal_id = "keagan@togetherplatform.com"
+def get_available_dates(start: date, end: date) -> list[date]:
+    dates = []
+    curr = start
+    while curr <= end:
+        if is_working_day(curr):
+            dates.append(curr)
+        curr += timedelta(days=1)
+    return dates
+
+def merge_intervals(intervals: list[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
+    intervals = sorted(intervals, key=lambda x: x[0])
+    merged = []
+    for s, e in intervals:
+        if not merged or merged[-1][1] < s:
+            merged.append([s, e])
+        else:
+            merged[-1][1] = max(merged[-1][1], e)
+    return [(s, e) for s, e in merged]
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+def call_openai(messages, functions=None, function_call=None):
+    payload = {"model": "gpt-4.1-nano", "messages": messages, "temperature": 0}
+    if functions:
+        payload["functions"] = functions
+    if function_call:
+        payload["function_call"] = function_call
     try:
-        channel_id = str(uuid.uuid4())
-        body = {
-            "id":      channel_id,
-            "type":    "web_hook",
-            "address": CALENDAR_WEBHOOK_URL,
-            "params":  {"ttl": "86400"}
+        resp = client.chat.completions.create(**payload)
+    except Exception:
+        payload["model"] = "gpt-4.1-mini"
+        resp = client.chat.completions.create(**payload)
+    return resp.choices[0].message
+
+def make_schedule_function() -> dict:
+    return {
+        "name": "assign_due_dates",
+        "description": "Assign due dates and durations for tasks within available work days.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "priority": {"type": "integer", "minimum": 1, "maximum": 4},
+                            "due_date": {"type": "string", "format": "date"},
+                            "duration_minutes": {"type": "integer", "minimum": 1}
+                        },
+                        "required": ["id", "priority", "due_date", "duration_minutes"]
+                    }
+                }
+            },
+            "required": ["tasks"]
         }
-        resp = calendar_service.events().watch(
-            calendarId=work_cal_id,
-            body=body
-        ).execute()
-        print("🛰️ Work calendar watch registered:", resp)
-    except Exception as e:
-        print(f"⚠️ Failed to register webhook for work calendar: {str(e)}")
-    
-    # Register webhook for Todoist item:updated event
-    access_token = store.get("access_token", STATIC_TOKEN)
-    if access_token:
-        try:
-            headers = {"Authorization": f"Bearer {access_token}"}
-            webhook_data = {
-                "event_types": ["item:updated"],
-                "project_id": PROJECT_ID,
-                "webhook_url": WEBHOOK_URL
-            }
-            resp = requests.post(
-                f"{TODOIST_BASE}/webhooks",
-                headers=headers,
-                json=webhook_data
-            )
-            resp.raise_for_status()
-            print(f"🛰️ Todoist item:updated webhook registered: {resp.json()}")
-        except Exception as e:
-            print(f"⚠️ Failed to register Todoist item:updated webhook: {str(e)}")
-
-# ── Health check ──
-@app.get("/healthz")
-def healthz():
-    return PlainTextResponse("OK", status_code=200)
-
-# ── Manual trigger ──
-@app.get("/run")
-def run_scheduler():
-    env = os.environ.copy()
-    env["TODOIST_API_TOKEN"] = store.get("access_token", STATIC_TOKEN)
-    try:
-        subprocess.run(["python", "ai_scheduler.py"], check=True, env=env)
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"Scheduler failed: {e}")
-    return {"status": "completed"}
-
-# ── OAuth start ──
-@app.get("/login")
-def login():
-    params = {
-        "client_id":    CLIENT_ID,
-        "scope":        "data:read_write,data:delete",
-        "state":        "todoist_integration",
-        "redirect_uri": REDIRECT_URI,
     }
-    url = "https://todoist.com/oauth/authorize?" + "&".join(f"{k}={v}" for k, v in params.items())
-    return RedirectResponse(url)
 
-# ── OAuth callback ──
-@app.get("/auth/callback")
-async def auth_callback(request: Request):
-    code  = request.query_params.get("code")
-    state = request.query_params.get("state")
-    if state != "todoist_integration" or not code:
-        raise HTTPException(400, "Invalid OAuth response")
+# —— Main Flow ——
+now      = datetime.now(tz)
+today    = now.date()
+max_date = today + timedelta(days=cfg["schedule_horizon_days"])
+avail    = get_available_dates(today, max_date)
+print(f"🔍 Work dates {today}→{max_date}: {[d.isoformat() for d in avail]}")
+date_strs = [d.isoformat() for d in avail]
 
-    resp = requests.post(
-        "https://todoist.com/oauth/access_token",
-        data={
-            "client_id":     CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "code":          code,
-            "redirect_uri":  REDIRECT_URI,
-        },
-    )
-    resp.raise_for_status()
-    token = resp.json().get("access_token")
-    if not token:
-        raise HTTPException(500, "No access token returned")
-
-    store["access_token"] = token
+# 1) Calendar busy slots
+def get_calendar_busy() -> dict:
+    busy = {d: [] for d in avail}
     
-    # Register webhook for Todoist item:updated event with the new token
-    try:
-        headers = {"Authorization": f"Bearer {token}"}
-        webhook_data = {
-            "event_types": ["item:updated"],
-            "project_id": PROJECT_ID,
-            "webhook_url": WEBHOOK_URL
-        }
-        resp = requests.post(
-            f"{TODOIST_BASE}/webhooks",
-            headers=headers,
-            json=webhook_data
-        )
-        resp.raise_for_status()
-        print(f"🛰️ Todoist item:updated webhook registered after OAuth: {resp.json()}")
-    except Exception as e:
-        print(f"⚠️ Failed to register Todoist item:updated webhook: {str(e)}")
-
-    return PlainTextResponse("✅ OAuth complete! You can close this tab.", status_code=200)
-
-# ── Todoist validation ping ──
-@app.get("/webhook")
-async def webhook_ping():
-    return PlainTextResponse("OK", status_code=200)
-
-# ── Incoming Todoist webhooks ──
-@app.post("/webhook")
-async def todoist_webhook(req: Request):
-    # debug: log full payload
-    try:
-        data = await req.json()
-    except Exception as e:
-        body = await req.body()
-        print("🛠️ Failed to parse JSON, raw body:", body)
-        return PlainTextResponse("invalid payload", status_code=400)
-    print("🛠️ Raw Todoist webhook payload:", json.dumps(data))
-
-    event = data.get("event_name")
-    event_data = data.get("event_data", {})
-    print(f"🛠️ event_name={event}, event_data={event_data}")
-
-    payload_proj = event_data.get("project_id")
-    print(f"🛠️ payload project_id={payload_proj}, configured PROJECT_ID={PROJECT_ID}")
-    if payload_proj != PROJECT_ID:
-        print(f"🛠️ Ignoring webhook for project {payload_proj}")
-        return PlainTextResponse("ignored", status_code=200)
-
-    task_id = event_data.get("id")
-    print(f"📬 Webhook received for {event} event, task: {task_id}")
-
-    # Handle item:updated event specifically
-    if event == "item:updated":
-        print(f"🔄 Task updated in Todoist: {task_id}")
+    # First, check the work calendar from config
+    cal_id = cfg["work_calendar_id"]
+    print(f"🔍 Checking work calendar: {cal_id}")
+    
+    for d in avail:
+        tmin = tz.localize(datetime.combine(d, work_start)).isoformat()
+        tmax = tz.localize(datetime.combine(d, work_end)).isoformat()
+        resp = calendar_service.events().list(
+            calendarId=cal_id,
+            timeMin=tmin,
+            timeMax=tmax,
+            singleEvents=True,
+            orderBy="startTime"
+        ).execute()
+        events = resp.get("items", [])
+        for ev in events:
+            summary = ev.get("summary", "")
+            if "Focus time" in summary:
+                continue
+            sf = ev.get("start", {}); ef = ev.get("end", {})
+            if "dateTime" in sf and "dateTime" in ef:
+                s = datetime.fromisoformat(sf["dateTime"]).astimezone(tz)
+                e = datetime.fromisoformat(ef["dateTime"]).astimezone(tz)
+                busy[d].append((s, e))
+                print(f"⚠️ No gap; defaulting {tid} to {due} at {pointer.time()}")
         
-        # Check if we need to update calendar event
-        due_info = event_data.get("due")
-        if due_info:
-            print(f"📅 Task has due date: {due_info}")
+        print(f"🎯 Final for {tid}: date={due}, start={pointer.time()}, dur={dur}m")
+        
+        # Use the correct priority from AI assignment or original task
+        priority = a.get('priority')
+        
+        # Create update payload with duration and priority
+        update_payload = {
+            "due_datetime": pointer.isoformat(),
+            "duration": dur,
+            "duration_unit": "minute"
+        }
+        
+        # Only include priority if it was specified
+        if priority:
+            update_payload["priority"] = priority
             
-            # delete any existing calendar events for that task
-            if task_id:
-                q = f"[{task_id}]"
-                existing = calendar_service.events().list(
-                    calendarId=GOOGLE_CAL_ID, q=q
-                ).execute().get("items", [])
-                for ev in existing:
-                    calendar_service.events().delete(
-                        calendarId=GOOGLE_CAL_ID,
-                        eventId=ev["id"]
-                    ).execute()
-                    print(f"🗑 Deleted calendar event {ev['id']} for task {task_id}")
+        # Update the task
+        requests.post(
+            f"{TODOIST_BASE}/tasks/{tid}", 
+            headers=HEADERS,
+            json=update_payload
+        ).raise_for_status()
+        
+        dslot = date.fromisoformat(due)
+        busy_slots.setdefault(dslot, []).append((pointer, pointer + timedelta(minutes=dur)))
+        busy_slots[dslot] = merge_intervals(busy_slots[dslot])
 
-    # fire off your scheduler in background
-    env = os.environ.copy()
-    env["TODOIST_API_TOKEN"] = store.get("access_token", STATIC_TOKEN)
-    subprocess.Popen(["python", "ai_scheduler.py"], env=env)
+# 6) Auto-prioritize today's tasks
+resp2 = requests.get(f"{TODOIST_BASE}/tasks", headers=HEADERS, params={"project_id": cfg['project_id']})
+resp2.raise_for_status()
+data2 = resp2.json()
+if isinstance(data2, dict):
+    tasks_list2 = data2.get('results') or data2.get('items') or []
+elif isinstance(data2, list):
+    tasks_list2 = data2
+else:
+    tasks_list2 = []
+tasks_today = [
+    {"id": str(t['id']), "priority": t.get('priority', 1)}
+    for t in tasks_list2
+    if (t.get('due') or {}).get('date') == today.isoformat()
+]
+if tasks_today:
+    fn2 = make_schedule_function()
+    fn2.update({
+        "name": "set_priorities",
+        "description": "Set priority for today's tasks based on importance.",
+        "parameters": fn2['parameters']
+    })
+    msgs2 = [
+        {"role": "system", "content": "You are a productivity coach for Todoist."},
+        {"role": "user", "content": f"Rank tasks: {json.dumps(tasks_today)}"}
+    ]
+    msg2 = call_openai(msgs2, functions=[fn2], function_call={"name": fn2['name']})
+    for r in json.loads(msg2.function_call.arguments).get('tasks', []):
+        requests.post(
+            f"{TODOIST_BASE}/tasks/{r['id']}", headers=HEADERS,
+            json={"priority": r['priority']}
+        ).raise_for_status()
+    print("🔧 Updated today's priorities")
 
-    return PlainTextResponse("OK", status_code=200)
+print("✅ ai_scheduler complete.")📅 Found busy slot on {d}: {s.time()} to {e.time()}: {summary}")
+            elif "date" in sf and "date" in ef:
+                busy[d].append((tz.localize(datetime.combine(d, work_start)), tz.localize(datetime.combine(d, work_end))))
+                print(f"📅 Found all-day event on {d}: {summary}")
+    
+    # Also check keagan@togetherplatform.com explicitly if it's different from work_calendar_id
+    if cal_id != "keagan@togetherplatform.com":
+        personal_cal_id = "keagan@togetherplatform.com"
+        print(f"🔍 Also checking personal calendar: {personal_cal_id}")
+        
+        try:
+            for d in avail:
+                tmin = tz.localize(datetime.combine(d, work_start)).isoformat()
+                tmax = tz.localize(datetime.combine(d, work_end)).isoformat()
+                resp = calendar_service.events().list(
+                    calendarId=personal_cal_id,
+                    timeMin=tmin,
+                    timeMax=tmax,
+                    singleEvents=True,
+                    orderBy="startTime"
+                ).execute()
+                events = resp.get("items", [])
+                for ev in events:
+                    summary = ev.get("summary", "")
+                    if "Focus time" in summary:
+                        continue
+                    sf = ev.get("start", {}); ef = ev.get("end", {})
+                    if "dateTime" in sf and "dateTime" in ef:
+                        s = datetime.fromisoformat(sf["dateTime"]).astimezone(tz)
+                        e = datetime.fromisoformat(ef["dateTime"]).astimezone(tz)
+                        busy[d].append((s, e))
+                        print(f"📅 Found busy slot on {d} from personal calendar: {s.time()} to {e.time()}: {summary}")
+                    elif "date" in sf and "date" in ef:
+                        busy[d].append((tz.localize(datetime.combine(d, work_start)), tz.localize(datetime.combine(d, work_end))))
+                        print(f"📅 Found all-day event on {d} from personal calendar: {summary}")
+        except Exception as e:
+            print(f"⚠️ Error accessing personal calendar: {str(e)}")
+    
+    return {d: merge_intervals(intervals) for d, intervals in busy.items()}
 
-# ── Google Calendar push notifications ──
-@app.post("/calendar/webhook")
-async def calendar_webhook(
-    req: Request,
-    x_goog_channel_id: str = Header(None),
-    x_goog_resource_state: str = Header(None),
-    x_goog_resource_id: str = Header(None),
-):
-    global last_scheduler_run
+calendar_busy = get_calendar_busy()
+
+# 2) Identify unscheduled/conflicted/overdue tasks
+def get_tasks_needing_scheduling(busy_calendar: dict) -> list:
+    r = requests.get(f"{TODOIST_BASE}/tasks", headers=HEADERS, params={"project_id": cfg["project_id"]})
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict):
+        tasks_raw = data.get("results") or data.get("items") or []
+    elif isinstance(data, list):
+        tasks_raw = data
+    else:
+        tasks_raw = []
     
-    print(f"📬 Calendar notification: state={x_goog_resource_state}, resource_id={x_goog_resource_id}")
+    needs_scheduling = []
+    for t in tasks_raw:
+        if not isinstance(t, dict):
+            continue
+        if t.get("recurring"): 
+            continue
+        if t.get("checked") or t.get("completed_at"):
+            continue
+            
+        due = t.get("due") or {}
+        dt = due.get("dateTime")
+        d = due.get("date")
+        tid = str(t.get("id"))
+        needs_update = False
+        
+        # Check if task is overdue or conflicts with calendar
+        if dt:
+            start = datetime.fromisoformat(dt).astimezone(tz)
+            # Skip if task is in the past AND already completed
+            if start < now and (t.get("checked") or t.get("completed_at")):
+                continue
+                
+            # Check if task is in the past
+            if start < now:
+                print(f"⚠️ Overdue task found: {t.get('content')} was due at {start.isoformat()}")
+                needs_update = True
+            else:
+                # Check if task conflicts with calendar events
+                task_date = start.date()
+                if task_date in busy_calendar:
+                    # Get task duration from task metadata or default
+                    duration_minutes = int(t.get("duration", cfg.get("default_task_duration_minutes", 15)))
+                    end_time = start + timedelta(minutes=duration_minutes)
+                    
+                    # Check for conflicts with busy calendar slots
+                    for bs, be in busy_calendar.get(task_date, []):
+                        # Check for any overlap between task and busy slot
+                        if (bs <= start < be) or (bs < end_time <= be) or (start <= bs and end_time >= be):
+                            print(f"⚠️ Task conflict: {t.get('content')} at {start.isoformat()} conflicts with calendar event")
+                            needs_update = True
+                            break
+        else:
+            # No due date set
+            needs_update = True
+            
+        if needs_update:
+            # Clear the current due date/time
+            requests.post(
+                f"{TODOIST_BASE}/tasks/{tid}", 
+                headers=HEADERS, 
+                json={"due_date": None, "due_datetime": None}
+            ).raise_for_status()
+            
+            # Get task details for scheduling
+            task_data = {
+                "id": tid, 
+                "content": t.get("content", ""), 
+                "priority": t.get("priority", 1),  # Default to priority 1 if not set
+                "created_at": t.get("created_at")
+            }
+            
+            # Include custom duration if defined
+            if "duration" in t:
+                task_data["duration"] = int(t.get("duration"))
+                
+            needs_scheduling.append(task_data)
     
-    # Only process notifications about changes to resources
-    if x_goog_resource_state not in ["exists", "sync"]:
-        return PlainTextResponse("ignored", status_code=200)
+    return needs_scheduling
+
+tasks_to_schedule = get_tasks_needing_scheduling(calendar_busy)
+
+# 3) Build full busy slots
+busy_slots = dict(calendar_busy)
+r_all = requests.get(f"{TODOIST_BASE}/tasks", headers=HEADERS, params={"project_id": cfg["project_id"]})
+r_all.raise_for_status()
+all_tasks = r_all.json()
+for t in all_tasks:
+    if not isinstance(t, dict): continue
+    due = t.get("due") or {}
+    dt = due.get("dateTime")
+    if dt:
+        start = datetime.fromisoformat(dt).astimezone(tz)
+        # Use duration from task if available, otherwise use default
+        dur = int(t.get("duration", cfg.get("default_task_duration_minutes", 15)))
+        end = start + timedelta(minutes=dur)
+        busy_slots.setdefault(start.date(), []).append((start, end))
+for d in busy_slots:
+    busy_slots[d] = merge_intervals(busy_slots[d])
+
+# 4) Priority decay
+BUFFER = cfg.get("buffer_minutes", 5)
+for task in tasks_to_schedule:
+    orig = task["priority"]
+    created = task.get("created_at")
+    if created:
+        c = date.fromisoformat(created[:10])
+        decay = max(0, (today - c).days) * cfg.get("priority_decay_per_day", 1)
+        new_prio = max(1, orig - decay)
+        if new_prio != orig:
+            print(f"⚠️ Decay {task['id']}: {orig}->{new_prio}")
+            task["priority"] = new_prio
+
+# 5) AI assignment & scheduling
+if tasks_to_schedule:
+    # Prepare task list for AI with appropriate durations
+    tasks_list = []
+    for t in tasks_to_schedule:
+        task_info = {
+            "id": t['id'], 
+            "priority": t['priority']
+        }
+        
+        # Use task-specific duration if available, otherwise use default
+        if "duration" in t:
+            task_info["duration_minutes"] = t["duration"]
+        else:
+            task_info["duration_minutes"] = cfg.get("default_task_duration_minutes", 15)
+            
+        tasks_list.append(task_info)
     
-    # Debounce: Don't run the scheduler if it was run in the last 3 minutes
-    current_time = datetime.utcnow()
-    if (current_time - last_scheduler_run).total_seconds() < 180:  # 3 minutes debounce
-        print("⏭️ Skipping webhook - scheduler was recently run")
-        return PlainTextResponse("debounced", status_code=200)
+    msgs = [
+        {"role": "system", "content": "You are an AI scheduling tasks within work hours."},
+        {"role": "user", "content": f"Dates: {date_strs}\nTasks: {json.dumps(tasks_list)}\nMax/day: {cfg['max_tasks_per_day']}"}
+    ]
+    res = call_openai(msgs, functions=[make_schedule_function()], function_call={"name": "assign_due_dates"})
+    assigns = json.loads(res.function_call.arguments).get("tasks", [])
+    print("🧠 AI raw assignments:")
+    for a in assigns:
+        print(f"  - {a}")
     
-    # Don't bother checking for specific events - just run the scheduler
-    # The scheduler itself will determine if there are conflicts that need resolution
-    print("🔄 Calendar change detected - running scheduler to check for conflicts")
+    # Block out current time as busy
+    current_time_buffer = timedelta(minutes=15)  # Buffer to ensure new tasks aren't scheduled too soon
+    current_date = now.date()
+    if current_date in busy_slots:
+        # Add the current time as busy to prevent scheduling in the past
+        current_busy = (now - current_time_buffer, now + current_time_buffer)
+        busy_slots[current_date].append(current_busy)
+        busy_slots[current_date] = merge_intervals(busy_slots[current_date])
     
-    # Update the last run time before executing
-    last_scheduler_run = current_time
-    
-    # Run the scheduler synchronously to prevent multiple instances
-    env = os.environ.copy()
-    env["TODOIST_API_TOKEN"] = store.get("access_token", STATIC_TOKEN)
-    subprocess.run(["python", "ai_scheduler.py"], env=env, check=True)
-    
-    return PlainTextResponse("Scheduler completed", status_code=200)
+    for a in assigns:
+        tid = a['id']
+        # Use duration from AI assignment, task metadata, or config default (in that order)
+        dur = a.get('duration_minutes')
+        
+        # If no duration in assignment, look for it in the original task data
+        if not dur:
+            for t in tasks_to_schedule:
+                if t['id'] == tid and 'duration' in t:
+                    dur = t['duration']
+                    break
+        
+        # If still no duration, use default
+        if not dur:
+            dur = cfg.get('default_task_duration_minutes', 15)
+            
+        due_input = a.get('due_date') or ''
+        candidates = [due_input] if due_input in date_strs else date_strs
+        pointer = None
+        
+        for dd in candidates:
+            ddate = date.fromisoformat(dd)
+            
+            # If scheduling for today, start from current time + buffer instead of work_start
+            if ddate == today:
+                ptr = max(
+                    tz.localize(datetime.combine(ddate, work_start)),
+                    now + timedelta(minutes=10)  # Add a 10-minute buffer from now
+                )
+            else:
+                ptr = tz.localize(datetime.combine(ddate, work_start))
+            
+            for bs, be in busy_slots.get(ddate, []):
+                if ptr + timedelta(minutes=dur) <= bs - timedelta(minutes=BUFFER):
+                    break
+                ptr = max(ptr, be + timedelta(minutes=BUFFER))
+            
+            if ptr + timedelta(minutes=dur) <= tz.localize(datetime.combine(ddate, work_end)):
+                due = dd
+                pointer = ptr
+                break
+        
+        if pointer is None:
+            # If no suitable time was found in any of the available dates
+            due = date_strs[0]
+            if date.fromisoformat(due) == today:
+                # For today, start from current time + buffer
+                pointer = max(
+                    tz.localize(datetime.combine(date.fromisoformat(due), work_start)),
+                    now + timedelta(minutes=10)
+                )
+            else:
+                pointer = tz.localize(datetime.combine(date.fromisoformat(due), work_start))
+            print(f"
