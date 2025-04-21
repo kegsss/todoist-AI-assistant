@@ -3,6 +3,7 @@ import os
 import json
 import subprocess
 import uuid
+import time
 from datetime import datetime, timedelta
 
 import requests
@@ -56,6 +57,9 @@ creds = service_account.Credentials.from_service_account_info(
     creds_info, scopes=["https://www.googleapis.com/auth/calendar"]
 )
 calendar_service = build("calendar", "v3", credentials=creds)
+
+# Track the last time the scheduler was run to debounce frequent calls
+last_scheduler_run = datetime.min
 
 @app.on_event("startup")
 def register_calendar_watch():
@@ -189,52 +193,43 @@ async def calendar_webhook(
     x_goog_channel_id: str = Header(None),
     x_goog_resource_state: str = Header(None),
 ):
+    global last_scheduler_run
+    
     print(f"📬 Calendar notification: state={x_goog_resource_state}")
     
     # Only process notifications about changes to resources
     if x_goog_resource_state not in ["exists", "sync"]:
         return PlainTextResponse("ignored", status_code=200)
     
+    # Debounce: Don't run the scheduler if it was run in the last minute
+    current_time = datetime.utcnow()
+    if (current_time - last_scheduler_run).total_seconds() < 60:  # 60 seconds debounce
+        print("⏭️ Skipping webhook - scheduler was recently run")
+        return PlainTextResponse("debounced", status_code=200)
+    
     # Check for recent calendar changes (last 30 minutes)
-    window_start = (datetime.utcnow() - timedelta(minutes=30)).isoformat() + "Z"
-    now = datetime.utcnow().isoformat() + "Z"
+    window_start = (current_time - timedelta(minutes=30)).isoformat() + "Z"
     
     try:
         events = calendar_service.events().list(
             calendarId=GOOGLE_CAL_ID,
             showDeleted=False,
             singleEvents=True,
-            updatedMin=window_start,  # Only get events updated recently
+            updatedMin=window_start,
             timeMin=window_start,
-            timeMax=(datetime.utcnow() + timedelta(days=14)).isoformat() + "Z"  # Look ahead 2 weeks
+            timeMax=(current_time + timedelta(days=14)).isoformat() + "Z"
         ).execute().get("items", [])
         
         if events:
-            print(f"🔄 Found {len(events)} recently changed calendar events, running scheduler to check for conflicts")
-            # Run the scheduler to handle any conflicts with tasks
+            print(f"🔄 Found {len(events)} recently changed calendar events, running scheduler")
+            # Update the last run time before executing
+            last_scheduler_run = current_time
+            
+            # Run the scheduler synchronously to prevent multiple instances
             env = os.environ.copy()
             env["TODOIST_API_TOKEN"] = store.get("access_token", STATIC_TOKEN)
-            subprocess.Popen(["python", "ai_scheduler.py"], env=env)
-            return PlainTextResponse("Scheduler triggered", status_code=200)
-        
-        # Also check for tasks that may have been missed (old code preserved)
-        events_ending = calendar_service.events().list(
-            calendarId=GOOGLE_CAL_ID,
-            showDeleted=False,
-            singleEvents=True,
-            timeMin=window_start,
-            timeMax=now
-        ).execute().get("items", [])
-
-        for ev in events_ending:
-            summary = ev.get("summary", "")
-            if summary.startswith("[") and not summary.startswith("✓"):
-                tid = summary[1:summary.index("]")]
-                print(f"⚠️ Task {tid} slot ended but not done; re‑queuing…")
-                env = os.environ.copy()
-                env["TODOIST_API_TOKEN"] = store.get("access_token", STATIC_TOKEN)
-                subprocess.Popen(["python", "ai_scheduler.py"], env=env)
-                return PlainTextResponse("Scheduler triggered for missed task", status_code=200)
+            subprocess.run(["python", "ai_scheduler.py"], env=env, check=True)
+            return PlainTextResponse("Scheduler completed", status_code=200)
         
         return PlainTextResponse("No relevant changes", status_code=200)
         
