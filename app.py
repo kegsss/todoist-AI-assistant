@@ -64,9 +64,9 @@ last_scheduler_run = datetime.min
 @app.on_event("startup")
 def register_calendar_watches():
     """
-    Register webhooks for the work calendar and Todoist item updates
-    """    
-    # Register webhook for your work calendar
+    Register webhooks for the work calendar and Todoist item updated event
+    """
+    # Register webhook for the work calendar only (not Todoist calendar)
     work_cal_id = "keagan@togetherplatform.com"
     try:
         channel_id = str(uuid.uuid4())
@@ -84,43 +84,25 @@ def register_calendar_watches():
     except Exception as e:
         print(f"⚠️ Failed to register webhook for work calendar: {str(e)}")
     
-    # Register webhook for Todoist item updates
-    try:
-        if STATIC_TOKEN:
-            headers = {"Authorization": f"Bearer {STATIC_TOKEN}"}
-            # First check if webhook already exists
-            try:
-                existing = requests.get(f"{TODOIST_BASE}/webhooks", headers=headers)
-                existing.raise_for_status()
-                existing_webhooks = existing.json()
-                
-                # Check for existing webhook with same URL
-                webhook_exists = False
-                if isinstance(existing_webhooks, list):
-                    for webhook in existing_webhooks:
-                        if webhook.get("url") == WEBHOOK_URL:
-                            webhook_exists = True
-                            print(f"🛰️ Todoist webhook already exists: {webhook}")
-                            break
-                
-                if not webhook_exists:
-                    # Create new webhook
-                    webhook_data = {
-                        "url": WEBHOOK_URL,
-                        "event_types": ["item:updated"]
-                    }
-                    
-                    resp = requests.post(
-                        f"{TODOIST_BASE}/webhooks",
-                        headers=headers,
-                        json=webhook_data
-                    )
-                    resp.raise_for_status()
-                    print(f"🛰️ Todoist item:updated webhook registered: {resp.json()}")
-            except Exception as e:
-                print(f"⚠️ Failed to check existing webhooks: {str(e)}")
-    except Exception as e:
-        print(f"⚠️ Failed to register Todoist webhook: {str(e)}")
+    # Register webhook for Todoist item:updated event
+    access_token = store.get("access_token", STATIC_TOKEN)
+    if access_token:
+        try:
+            headers = {"Authorization": f"Bearer {access_token}"}
+            webhook_data = {
+                "event_types": ["item:updated"],
+                "project_id": PROJECT_ID,
+                "webhook_url": WEBHOOK_URL
+            }
+            resp = requests.post(
+                f"{TODOIST_BASE}/webhooks",
+                headers=headers,
+                json=webhook_data
+            )
+            resp.raise_for_status()
+            print(f"🛰️ Todoist item:updated webhook registered: {resp.json()}")
+        except Exception as e:
+            print(f"⚠️ Failed to register Todoist item:updated webhook: {str(e)}")
 
 # ── Health check ──
 @app.get("/healthz")
@@ -174,42 +156,23 @@ async def auth_callback(request: Request):
 
     store["access_token"] = token
     
-    # Register webhook for Todoist item updates
+    # Register webhook for Todoist item:updated event with the new token
     try:
         headers = {"Authorization": f"Bearer {token}"}
-        # First check if webhook already exists
-        try:
-            existing = requests.get(f"{TODOIST_BASE}/webhooks", headers=headers)
-            existing.raise_for_status()
-            existing_webhooks = existing.json()
-            
-            # Check for existing webhook with same URL
-            webhook_exists = False
-            if isinstance(existing_webhooks, list):
-                for webhook in existing_webhooks:
-                    if webhook.get("url") == WEBHOOK_URL:
-                        webhook_exists = True
-                        print(f"🛰️ Todoist webhook already exists after OAuth: {webhook}")
-                        break
-            
-            if not webhook_exists:
-                # Create new webhook
-                webhook_data = {
-                    "url": WEBHOOK_URL,
-                    "event_types": ["item:updated"]
-                }
-                
-                resp = requests.post(
-                    f"{TODOIST_BASE}/webhooks",
-                    headers=headers,
-                    json=webhook_data
-                )
-                resp.raise_for_status()
-                print(f"🛰️ Todoist item:updated webhook registered after OAuth: {resp.json()}")
-        except Exception as e:
-            print(f"⚠️ Failed to check existing webhooks after OAuth: {str(e)}")
+        webhook_data = {
+            "event_types": ["item:updated"],
+            "project_id": PROJECT_ID,
+            "webhook_url": WEBHOOK_URL
+        }
+        resp = requests.post(
+            f"{TODOIST_BASE}/webhooks",
+            headers=headers,
+            json=webhook_data
+        )
+        resp.raise_for_status()
+        print(f"🛰️ Todoist item:updated webhook registered after OAuth: {resp.json()}")
     except Exception as e:
-        print(f"⚠️ Failed to register Todoist webhook after OAuth: {str(e)}")
+        print(f"⚠️ Failed to register Todoist item:updated webhook: {str(e)}")
 
     return PlainTextResponse("✅ OAuth complete! You can close this tab.", status_code=200)
 
@@ -230,23 +193,21 @@ async def todoist_webhook(req: Request):
         return PlainTextResponse("invalid payload", status_code=400)
     print("🛠️ Raw Todoist webhook payload:", json.dumps(data))
 
-    event_name = data.get("event_name")
+    event = data.get("event_name")
     event_data = data.get("event_data", {})
-    print(f"🛠️ event_name={event_name}, event_data={event_data}")
+    print(f"🛠️ event_name={event}, event_data={event_data}")
 
-    # Extract project_id from the event data
-    project_id = event_data.get("project_id")
-    print(f"🛠️ payload project_id={project_id}, configured PROJECT_ID={PROJECT_ID}")
-    
-    if project_id != PROJECT_ID:
-        print(f"🛠️ Ignoring webhook for project {project_id}")
+    payload_proj = event_data.get("project_id")
+    print(f"🛠️ payload project_id={payload_proj}, configured PROJECT_ID={PROJECT_ID}")
+    if payload_proj != PROJECT_ID:
+        print(f"🛠️ Ignoring webhook for project {payload_proj}")
         return PlainTextResponse("ignored", status_code=200)
 
     task_id = event_data.get("id")
-    print(f"📬 Webhook received for {event_name} event, task: {task_id}")
+    print(f"📬 Webhook received for {event} event, task: {task_id}")
 
     # Handle item:updated event specifically
-    if event_name == "item:updated":
+    if event == "item:updated":
         print(f"🔄 Task updated in Todoist: {task_id}")
         
         # Check if we need to update calendar event
