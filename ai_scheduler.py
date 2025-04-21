@@ -173,7 +173,11 @@ if unscheduled:
             "Estimate `duration_minutes` realistically."
         )}
     ]
-    message = call_openai(messages, functions=[fn])
+    message = call_openai(
+        messages, 
+        functions=[fn],
+        function_call={"name": fn["name"]}
+    )    
     raw     = message.function_call.arguments
     print("📝 Raw AI assignments:", raw)
     result  = json.loads(raw)
