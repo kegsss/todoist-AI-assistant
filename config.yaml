@@ -1,6 +1,7 @@
 project_id: 6Xp2pfmF8wCWr3Gf  # your Todoist project
 max_tasks_per_day: 10         # cap how many new tasks per day
 schedule_horizon_days: 7      # look this many days ahead
+work_calendar_id: "keagan@togetherplatform.com" #calendar to look at for work busy times
 
 timezone: America/Toronto     # your IANA timezone
 
