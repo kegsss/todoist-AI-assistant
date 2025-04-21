@@ -28,7 +28,6 @@ if not (OPENAI_KEY and TODOIST_TOKEN and GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_
 with open("config.yaml", "r") as f:
     cfg = yaml.safe_load(f)
 
-# Ensure work_calendar_id is set
 if "work_calendar_id" not in cfg:
     print("⚠️ Missing 'work_calendar_id' in config.yaml")
     sys.exit(1)
@@ -142,15 +141,12 @@ def get_busy_slots():
             summary     = ev.get("summary", "")
             start_field = ev.get("start", {})
             end_field   = ev.get("end", {})
-            # skip Focus Time always
             if summary == "Focus Time":
                 continue
-            # timed event
             if "dateTime" in start_field and "dateTime" in end_field:
                 s = datetime.fromisoformat(start_field["dateTime"]).astimezone(tz)
                 e = datetime.fromisoformat(end_field["dateTime"]).astimezone(tz)
                 busy[d].append((s, e))
-            # all-day event blocks full work hours
             elif "date" in start_field and "date" in end_field:
                 s = tz.localize(datetime.combine(d, work_start))
                 e = tz.localize(datetime.combine(d, work_end))
@@ -177,23 +173,18 @@ for task in unscheduled:
 
 # —— 4) AI assignment ——
 if unscheduled:
-    # —— 4) AI assignment ——
-if unscheduled:
-    # Prepare AI prompt content
-    tasks_list = [{"id": t["id"], "priority": t["priority"]} for t in unscheduled]
+    tasks_list   = [{"id": t["id"], "priority": t["priority"]} for t in unscheduled]
     user_content = (
-        f"Dates: {date_strs}
-"
-        f"Tasks: {json.dumps(tasks_list)}
-"
+        f"Dates: {date_strs}\n"
+        f"Tasks: {json.dumps(tasks_list)}\n"
         f"Max/day: {cfg['max_tasks_per_day']}"
     )
-    msgs = [
+    msgs     = [
         {"role": "system", "content": "You are an AI scheduling tasks."},
         {"role": "user",   "content": user_content}
     ]
-    res     = call_openai(msgs, functions=[make_schedule_function()], function_call={"name": "assign_due_dates"})
-    assigns = json.loads(res.function_call.arguments).get("tasks", [])(res.function_call.arguments).get("tasks", [])(res.function_call.arguments).get('tasks', [])
+    res      = call_openai(msgs, functions=[make_schedule_function()], function_call={"name": "assign_due_dates"})
+    assigns  = json.loads(res.function_call.arguments).get("tasks", [])
 
     print("🧠 AI raw assignments:")
     for a in assigns:
@@ -201,78 +192,78 @@ if unscheduled:
 
     # —— 5) Schedule tasks without overlap ——
     for a in assigns:
-        tid = a['id']
-        dur = a.get('duration_minutes', cfg.get('default_task_duration_minutes', 60))
-        due_input = a.get('due_date') or ''
-        # Determine candidate dates: if AI provided a valid one use that, else try all avail dates
-        if due_input in date_strs:
-            candidate_dates = [due_input]
-        else:
-            print(f"⚠️ Invalid/missing due_date for {tid} ('{due_input}'), searching available dates...")
-            candidate_dates = date_strs
+        tid        = a['id']
+        dur        = a.get('duration_minutes', cfg.get('default_task_duration_minutes',60))
+        due_input  = a.get('due_date', '')
+        candidate_dates = [due_input] if due_input in date_strs else date_strs
+
         pointer = None
         for dd in candidate_dates:
             ddate = date.fromisoformat(dd)
-            # start at beginning of work hours
-            ptr = tz.localize(datetime.combine(ddate, work_start))
-            for start, end in busy_slots.get(ddate, []):
+            ptr   = tz.localize(datetime.combine(ddate, work_start))
+            for start,end in busy_slots.get(ddate, []):
                 if ptr + timedelta(minutes=dur) <= start - timedelta(minutes=BUFFER):
                     break
                 ptr = max(ptr, end + timedelta(minutes=BUFFER))
-            # check fits before work_end
             if ptr + timedelta(minutes=dur) <= tz.localize(datetime.combine(ddate, work_end)):
-                due = dd
+                due     = dd
                 pointer = ptr
                 break
-        # if no slot found, fallback to first date at work_start
-        if pointer is None:
-            due = date_strs[0]
-            pointer = tz.localize(datetime.combine(date.fromisoformat(due), work_start))
-            print(f"⚠️ No free gap found; defaulting {tid} to {due} at {pointer.time()}")
-        print(f"🎯 Final for {tid}: date={due}, start={pointer.time()}, dur={dur}m")
 
-        # update Todoist
+        if pointer is None:
+            due     = date_strs[0]
+            pointer = tz.localize(datetime.combine(date.fromisoformat(due), work_start))
+            print(f"⚠️ No free gap; defaulting {tid} to {due} at {pointer.time()}")
+
+        print(f"🎯 Final for {tid}: date={due}, start={pointer.time()}, dur={dur}m")
         requests.post(
-            f"{TODOIST_BASE}/tasks/{tid}",
-            headers=HEADERS,
+            f"{TODOIST_BASE}/tasks/{tid}", headers=HEADERS,
             json={
-                "due_date": pointer.date().isoformat(),
-                "due_datetime": pointer.isoformat(),
-                "duration": dur,
+                "due_date":      pointer.date().isoformat(),
+                "due_datetime":  pointer.isoformat(),
+                "duration":      dur,
                 "duration_unit": "minute"
             }
         ).raise_for_status()
 
-        # update busy_slots
-        dslot = date.fromisoformat(due)
-        busy_slots[dslot].append((pointer, pointer + timedelta(minutes=dur)))
-        busy_slots[dslot].sort(key=lambda x: x[0])
+        slot_day = date.fromisoformat(due)
+        busy_slots[slot_day].append((pointer, pointer + timedelta(minutes=dur)))
+        busy_slots[slot_day].sort(key=lambda x: x[0])
 
 # —— 6) Auto‑prioritize today’s tasks ——
 resp2 = requests.get(
     f"{TODOIST_BASE}/tasks", headers=HEADERS,
-    params={"project_id":cfg['project_id']}  
+    params={"project_id": cfg['project_id']}  
 )
 resp2.raise_for_status()
-data2 = resp2.json()
-list2 = data2.get('results', data2 if isinstance(data2,list) else [])
+data2   = resp2.json()
+list2   = data2.get('results', data2 if isinstance(data2, list) else [])
 
 tasks_today = [
-    {"id":str(t['id']),"priority":t.get('priority',4)}
+    {"id": str(t['id']), "priority": t.get('priority',4)}
     for t in list2
-    if (t.get('due') or {}).get('date')==today.isoformat()
+    if (t.get('due') or {}).get('date') == today.isoformat()
 ]
 if tasks_today:
-    fn2 = {"name":"set_priorities","description":"Set priority for today's tasks based on importance.","parameters":{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"priority":{"type":"integer","minimum":1,"maximum":4}},"required":["id","priority"]}}},"required":["tasks"]}}
+    fn2 = {
+        "name": "set_priorities",
+        "description": "Set priority for today's tasks based on importance.",
+        "parameters": {"type": "object", "properties": {
+            "tasks": {"type": "array", "items": {"type": "object", "properties": {
+                "id": {"type": "string"},
+                "priority": {"type": "integer", "minimum": 1, "maximum": 4}
+            }, "required": ["id","priority"]}}
+        }, "required": ["tasks"]}
+    }
     msgs2 = [
-        {"role":"system","content":"You are a productivity coach for Todoist."},
-        {"role":"user","content":f"Rank tasks: {json.dumps(tasks_today)}"}
+        {"role": "system", "content": "You are a productivity coach for Todoist."},
+        {"role": "user",   "content": f"Rank tasks: {json.dumps(tasks_today)}"}
     ]
-    msg2 = call_openai(msgs2, functions=[fn2], function_call={"name":fn2['name']})
-    for r in json.loads(msg2.function_call.arguments).get('tasks',[]):
+    msg2 = call_openai(msgs2, functions=[fn2], function_call={"name": fn2['name']})
+    for r in json.loads(msg2.function_call.arguments).get('tasks', []):
         requests.post(
-            f"{TODOIST_BASE}/tasks/{r['id']}",headers=HEADERS,
-            json={"priority":r['priority']}
+            f"{TODOIST_BASE}/tasks/{r['id']}", headers=HEADERS,
+            json={"priority": r['priority']}
         ).raise_for_status()
     print("🔧 Updated today's priorities")
 
