@@ -138,16 +138,27 @@ async def webhook_ping():
 # ── Incoming Todoist webhooks ──
 @app.post("/webhook")
 async def todoist_webhook(req: Request):
-    data    = await req.json()
-    event   = data.get("event_name")
-    payload = data.get("event_data", {})
+    # debug: log full payload
+    try:
+        data = await req.json()
+    except Exception as e:
+        body = await req.body()
+        print("🛠️ Failed to parse JSON, raw body:", body)
+        return PlainTextResponse("invalid payload", status_code=400)
+    print("🛠️ Raw Todoist webhook payload:", json.dumps(data))
 
-    # ignore events outside your configured project
-    if payload.get("project_id") != PROJECT_ID:
-        return PlainTextResponse("ignored", 200)
+    event = data.get("event_name")
+    event_data = data.get("event_data", {})
+    print(f"🛠️ event_name={event}, event_data={event_data}")
 
-    task_id = payload.get("id")
-    print("📬 Webhook received for project:", event, "task:", task_id)
+    payload_proj = event_data.get("project_id")
+    print(f"🛠️ payload project_id={payload_proj}, configured PROJECT_ID={PROJECT_ID}")
+    if payload_proj != PROJECT_ID:
+        print(f"🛠️ Ignoring webhook for project {payload_proj}")
+        return PlainTextResponse("ignored", status_code=200)
+
+    task_id = event_data.get("id")
+    print("📬 Webhook received for project event", event, "task:", task_id)
 
     # delete any existing calendar events for that task
     if task_id:
@@ -179,9 +190,8 @@ async def calendar_webhook(
     print(f"📬 Calendar notification: state={x_goog_resource_state}")
     # only handle “exists” (changed) pushes
     if x_goog_resource_state != "exists":
-        return PlainTextResponse("ignored", 200)
+        return PlainTextResponse("ignored", status_code=200)
 
-    # look at events ended in the last few minutes
     window_start = (datetime.utcnow() - timedelta(minutes=5)).isoformat() + "Z"
     now          = datetime.utcnow().isoformat() + "Z"
     events = calendar_service.events().list(
@@ -194,7 +204,6 @@ async def calendar_webhook(
 
     for ev in events:
         summary = ev.get("summary", "")
-        # if not yet marked complete (no leading “✓ ”)
         if summary.startswith("[") and not summary.startswith("✓"):
             tid = summary[1:summary.index("]")]
             print(f"⚠️ Task {tid} slot ended but not done; re‑queuing…")
