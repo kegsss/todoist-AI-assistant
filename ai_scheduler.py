@@ -177,16 +177,19 @@ for task in unscheduled:
 
 # —— 4) AI assignment ——
 if unscheduled:
-    msgs     = [
-        {"role":"system","content":"You are an AI scheduling tasks."},
-        {"role":"user","content":(
-            f"Dates: {date_strs}\n"
-            f"Tasks: {json.dumps([{'id':t['id'],'priority':t['priority']} for t in unscheduled])}\n"
+    msgs = [
+        {"role": "system", "content": "You are an AI scheduling tasks."},
+        {"role": "user",   "content": (
+            f"Dates: {date_strs}
+"
+            f"Tasks: {json.dumps([{'id':t['id'],'priority':t['priority']} for t in unscheduled])}
+"
             f"Max/day: {cfg['max_tasks_per_day']}"
         )}
     ]
-    res      = call_openai(msgs, functions=[make_schedule_function()], function_call={"name":"assign_due_dates"})
-    assigns  = json.loads(res.function_call.arguments).get('tasks', [])
+    res     = call_openai(msgs, functions=[make_schedule_function()], function_call={"name":"assign_due_dates"})
+    assigns = json.loads(res.function_call.arguments).get('tasks', [])
+
     print("🧠 AI raw assignments:")
     for a in assigns:
         print(f"  - {a}")
@@ -194,30 +197,51 @@ if unscheduled:
     # —— 5) Schedule tasks without overlap ——
     for a in assigns:
         tid = a['id']
-        due = a.get('due_date', date_strs[0])
-        if due not in date_strs:
-            due = date_strs[0]
-            print(f"⚠️ Defaulted due for {tid} to {due}")
-        dur = a.get('duration_minutes', cfg.get('default_task_duration_minutes',60))
-        d   = date.fromisoformat(due)
-
-        pointer = tz.localize(datetime.combine(d, work_start))
-        for start,end in busy_slots.get(d,[]):
-            if pointer + timedelta(minutes=dur) <= start - timedelta(minutes=BUFFER):
+        dur = a.get('duration_minutes', cfg.get('default_task_duration_minutes', 60))
+        due_input = a.get('due_date') or ''
+        # Determine candidate dates: if AI provided a valid one use that, else try all avail dates
+        if due_input in date_strs:
+            candidate_dates = [due_input]
+        else:
+            print(f"⚠️ Invalid/missing due_date for {tid} ('{due_input}'), searching available dates...")
+            candidate_dates = date_strs
+        pointer = None
+        for dd in candidate_dates:
+            ddate = date.fromisoformat(dd)
+            # start at beginning of work hours
+            ptr = tz.localize(datetime.combine(ddate, work_start))
+            for start, end in busy_slots.get(ddate, []):
+                if ptr + timedelta(minutes=dur) <= start - timedelta(minutes=BUFFER):
+                    break
+                ptr = max(ptr, end + timedelta(minutes=BUFFER))
+            # check fits before work_end
+            if ptr + timedelta(minutes=dur) <= tz.localize(datetime.combine(ddate, work_end)):
+                due = dd
+                pointer = ptr
                 break
-            pointer = max(pointer, end + timedelta(minutes=BUFFER))
-        day_end = tz.localize(datetime.combine(d, work_end))
-        if pointer + timedelta(minutes=dur) > day_end:
-            pointer = day_end - timedelta(minutes=dur)
+        # if no slot found, fallback to first date at work_start
+        if pointer is None:
+            due = date_strs[0]
+            pointer = tz.localize(datetime.combine(date.fromisoformat(due), work_start))
+            print(f"⚠️ No free gap found; defaulting {tid} to {due} at {pointer.time()}")
+        print(f"🎯 Final for {tid}: date={due}, start={pointer.time()}, dur={dur}m")
 
-        print(f"🎯 Final for {tid}: start={pointer.time()}, dur={dur}m, priority={a.get('priority')}")
+        # update Todoist
         requests.post(
-            f"{TODOIST_BASE}/tasks/{tid}", headers=HEADERS,
-            json={"due_datetime":pointer.isoformat(),"duration":dur,"duration_unit":"minute"}
+            f"{TODOIST_BASE}/tasks/{tid}",
+            headers=HEADERS,
+            json={
+                "due_date": pointer.date().isoformat(),
+                "due_datetime": pointer.isoformat(),
+                "duration": dur,
+                "duration_unit": "minute"
+            }
         ).raise_for_status()
 
-        busy_slots[d].append((pointer, pointer+timedelta(minutes=dur)))
-        busy_slots[d].sort(key=lambda x:x[0])
+        # update busy_slots
+        dslot = date.fromisoformat(due)
+        busy_slots[dslot].append((pointer, pointer + timedelta(minutes=dur)))
+        busy_slots[dslot].sort(key=lambda x: x[0])
 
 # —— 6) Auto‑prioritize today’s tasks ——
 resp2 = requests.get(
