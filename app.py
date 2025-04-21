@@ -221,48 +221,22 @@ async def calendar_webhook(
     if x_goog_resource_state not in ["exists", "sync"]:
         return PlainTextResponse("ignored", status_code=200)
     
-    # Debounce: Don't run the scheduler if it was run in the last minute
+    # Debounce: Don't run the scheduler if it was run in the last 3 minutes
     current_time = datetime.utcnow()
-    if (current_time - last_scheduler_run).total_seconds() < 60:  # 60 seconds debounce
+    if (current_time - last_scheduler_run).total_seconds() < 180:  # 3 minutes debounce
         print("⏭️ Skipping webhook - scheduler was recently run")
         return PlainTextResponse("debounced", status_code=200)
     
-    # We'll check both the Todoist calendar and work calendar for changes
-    calendars_to_check = [
-        GOOGLE_CAL_ID,                  # Todoist calendar
-        "keagan@togetherplatform.com"   # Work calendar
-    ]
+    # Don't bother checking for specific events - just run the scheduler
+    # The scheduler itself will determine if there are conflicts that need resolution
+    print("🔄 Calendar change detected - running scheduler to check for conflicts")
     
-    # Check for recent calendar changes (last 30 minutes)
-    window_start = (current_time - timedelta(minutes=30)).isoformat() + "Z"
-    has_changes = False
+    # Update the last run time before executing
+    last_scheduler_run = current_time
     
-    for calendar_id in calendars_to_check:
-        try:
-            events = calendar_service.events().list(
-                calendarId=calendar_id,
-                showDeleted=False,
-                singleEvents=True,
-                updatedMin=window_start,
-                timeMin=window_start,
-                timeMax=(current_time + timedelta(days=14)).isoformat() + "Z"
-            ).execute().get("items", [])
-            
-            if events:
-                print(f"🔄 Found {len(events)} recently changed events in {calendar_id}")
-                has_changes = True
-        except Exception as e:
-            print(f"⚠️ Error checking calendar {calendar_id}: {str(e)}")
+    # Run the scheduler synchronously to prevent multiple instances
+    env = os.environ.copy()
+    env["TODOIST_API_TOKEN"] = store.get("access_token", STATIC_TOKEN)
+    subprocess.run(["python", "ai_scheduler.py"], env=env, check=True)
     
-    if has_changes:
-        print("🔄 Running scheduler to check for conflicts")
-        # Update the last run time before executing
-        last_scheduler_run = current_time
-        
-        # Run the scheduler synchronously to prevent multiple instances
-        env = os.environ.copy()
-        env["TODOIST_API_TOKEN"] = store.get("access_token", STATIC_TOKEN)
-        subprocess.run(["python", "ai_scheduler.py"], env=env, check=True)
-        return PlainTextResponse("Scheduler completed", status_code=200)
-    
-    return PlainTextResponse("No relevant changes", status_code=200)
+    return PlainTextResponse("Scheduler completed", status_code=200)
