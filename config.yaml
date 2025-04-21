@@ -7,3 +7,7 @@ timezone: America/Toronto     # your IANA timezone
 work_hours:                   # only schedule within these hours
   start: "09:00"
   end:   "17:00"
+
+buffer_minutes: 5                     # gap (in minutes) between back‑to‑back tasks
+priority_decay_per_day: 1             # how much priority to subtract per day old
+default_task_duration_minutes: 15     # fallback task length when AI omits it
