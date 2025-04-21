@@ -147,8 +147,13 @@ def get_busy_slots():
             orderBy="startTime"
         ).execute().get("items", [])
         for ev in events:
-            s = datetime.fromisoformat(ev["start"]["dateTime"]).astimezone(tz)
-            e = datetime.fromisoformat(ev["end"]["dateTime"]).astimezone(tz)
+            start_field = ev.get("start", {})
+            end_field = ev.get("end", {})
+            # only consider events with a dateTime (skip all-day events)
+            if "dateTime" not in start_field or "dateTime" not in end_field:
+                continue
+            s = datetime.fromisoformat(start_field["dateTime"]).astimezone(tz)
+            e = datetime.fromisoformat(end_field["dateTime"]).astimezone(tz)
             busy[d].append((s, e))
     for d in busy:
         busy[d].sort(key=lambda x: x[0])
