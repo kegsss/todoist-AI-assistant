@@ -214,7 +214,7 @@ async def todoist_webhook(req: Request):
     print("📬 Processing webhook for", event, "task:", task_id)
     
     # Apply a reasonable debounce for scheduler runs
-    if (datetime.utcnow() - last_scheduler_run).total_seconds() < 300:  # 5 minutes
+    if (datetime.utcnow() - last_scheduler_run).total_seconds() < 120:  # 2 minutes
         print("⏭️ Skipping scheduler - was recently run")
         return PlainTextResponse("OK", status_code=200)
     
