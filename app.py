@@ -45,9 +45,6 @@ missing = [k for k,v in required.items() if not v]
 if missing:
     raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
 
-# Keep PROJECT_ID as string for webhook comparisons
-# PROJECT_ID = int(PROJECT_ID)  # removed to allow string based matching
-
 # ── In‑memory OAuth store ──
 store = {}
 
@@ -163,7 +160,8 @@ async def webhook_ping():
 # ── Incoming Todoist webhooks ──
 @app.post("/webhook")
 async def todoist_webhook(req: Request):
-    # debug: log full payload
+    global last_scheduler_run
+    
     try:
         data = await req.json()
     except Exception as e:
@@ -185,20 +183,16 @@ async def todoist_webhook(req: Request):
     task_id = event_data.get("id")
     print("📬 Webhook received for project event", event, "task:", task_id)
 
-    # delete any existing calendar events for that task
-    if task_id:
-        q = f"[{task_id}]"
-        existing = calendar_service.events().list(
-            calendarId=GOOGLE_CAL_ID, q=q
-        ).execute().get("items", [])
-        for ev in existing:
-            calendar_service.events().delete(
-                calendarId=GOOGLE_CAL_ID,
-                eventId=ev["id"]
-            ).execute()
-            print(f"🗑 Deleted calendar event {ev['id']} for task {task_id}")
-
-    # fire off your scheduler in background
+    # Apply a reasonable debounce for scheduler runs (5 minutes)
+    current_time = datetime.utcnow()
+    if (current_time - last_scheduler_run).total_seconds() < 300:  # 5 minutes
+        print("⏭️ Skipping webhook - scheduler was recently run")
+        return PlainTextResponse("debounced", status_code=200)
+    
+    # Update the last run time
+    last_scheduler_run = current_time
+    
+    # Run the scheduler
     env = os.environ.copy()
     env["TODOIST_API_TOKEN"] = store.get("access_token", STATIC_TOKEN)
     subprocess.Popen(["python", "ai_scheduler.py"], env=env)
@@ -213,30 +207,6 @@ async def calendar_webhook(
     x_goog_resource_state: str = Header(None),
     x_goog_resource_id: str = Header(None),
 ):
-    global last_scheduler_run
-    
     print(f"📬 Calendar notification: state={x_goog_resource_state}, resource_id={x_goog_resource_id}")
-    
-    # Only process notifications about changes to resources
-    if x_goog_resource_state not in ["exists", "sync"]:
-        return PlainTextResponse("ignored", status_code=200)
-    
-    # Debounce: Don't run the scheduler if it was run in the last 3 minutes
-    current_time = datetime.utcnow()
-    if (current_time - last_scheduler_run).total_seconds() < 180:  # 3 minutes debounce
-        print("⏭️ Skipping webhook - scheduler was recently run")
-        return PlainTextResponse("debounced", status_code=200)
-    
-    # Don't bother checking for specific events - just run the scheduler
-    # The scheduler itself will determine if there are conflicts that need resolution
-    print("🔄 Calendar change detected - running scheduler to check for conflicts")
-    
-    # Update the last run time before executing
-    last_scheduler_run = current_time
-    
-    # Run the scheduler synchronously to prevent multiple instances
-    env = os.environ.copy()
-    env["TODOIST_API_TOKEN"] = store.get("access_token", STATIC_TOKEN)
-    subprocess.run(["python", "ai_scheduler.py"], env=env, check=True)
-    
-    return PlainTextResponse("Scheduler completed", status_code=200)
+    print("⏭️ Skipping webhook - calendar events are handled by Todoist's native integration")
+    return PlainTextResponse("OK", status_code=200)
