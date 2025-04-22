@@ -228,8 +228,8 @@ def get_tasks_needing_scheduling(busy_calendar: dict) -> list:
                 # Check if task conflicts with calendar events
                 task_date = start.date()
                 if task_date in busy_calendar:
-                    # Get task duration - default to config if not specified
-                    duration_minutes = t.get("duration") or cfg.get("default_task_duration_minutes", 60)
+                    # Get task duration from task metadata or default
+                    duration_minutes = int(t.get("duration", cfg.get("default_task_duration_minutes", 15)))
                     end_time = start + timedelta(minutes=duration_minutes)
                     
                     # Check for conflicts with busy calendar slots
@@ -251,12 +251,19 @@ def get_tasks_needing_scheduling(busy_calendar: dict) -> list:
                 json={"due_date": None, "due_datetime": None}
             ).raise_for_status()
             
-            needs_scheduling.append({
+            # Get task details for scheduling
+            task_data = {
                 "id": tid, 
                 "content": t.get("content", ""), 
-                "priority": t.get("priority", 4), 
+                "priority": t.get("priority", 1),  # Default to priority 1 if not set
                 "created_at": t.get("created_at")
-            })
+            }
+            
+            # Include custom duration if defined
+            if "duration" in t:
+                task_data["duration"] = int(t.get("duration"))
+                
+            needs_scheduling.append(task_data)
     
     return needs_scheduling
 
@@ -273,7 +280,8 @@ for t in all_tasks:
     dt = due.get("dateTime")
     if dt:
         start = datetime.fromisoformat(dt).astimezone(tz)
-        dur = t.get("duration") or cfg.get("default_task_duration_minutes", 60)
+        # Use duration from task if available, otherwise use default
+        dur = int(t.get("duration", cfg.get("default_task_duration_minutes", 15)))
         end = start + timedelta(minutes=dur)
         busy_slots.setdefault(start.date(), []).append((start, end))
 for d in busy_slots:
@@ -294,7 +302,22 @@ for task in tasks_to_schedule:
 
 # 5) AI assignment & scheduling
 if tasks_to_schedule:
-    tasks_list = [{"id": t['id'], "priority": t['priority']} for t in tasks_to_schedule]
+    # Prepare task list for AI with appropriate durations
+    tasks_list = []
+    for t in tasks_to_schedule:
+        task_info = {
+            "id": t['id'], 
+            "priority": t['priority']
+        }
+        
+        # Use task-specific duration if available, otherwise use default
+        if "duration" in t:
+            task_info["duration_minutes"] = t["duration"]
+        else:
+            task_info["duration_minutes"] = cfg.get("default_task_duration_minutes", 15)
+            
+        tasks_list.append(task_info)
+    
     msgs = [
         {"role": "system", "content": "You are an AI scheduling tasks within work hours."},
         {"role": "user", "content": f"Dates: {date_strs}\nTasks: {json.dumps(tasks_list)}\nMax/day: {cfg['max_tasks_per_day']}"}
@@ -316,7 +339,20 @@ if tasks_to_schedule:
     
     for a in assigns:
         tid = a['id']
-        dur = a.get('duration_minutes', cfg.get('default_task_duration_minutes', 60))
+        # Use duration from AI assignment, task metadata, or config default (in that order)
+        dur = a.get('duration_minutes')
+        
+        # If no duration in assignment, look for it in the original task data
+        if not dur:
+            for t in tasks_to_schedule:
+                if t['id'] == tid and 'duration' in t:
+                    dur = t['duration']
+                    break
+        
+        # If still no duration, use default
+        if not dur:
+            dur = cfg.get('default_task_duration_minutes', 15)
+            
         due_input = a.get('due_date') or ''
         candidates = [due_input] if due_input in date_strs else date_strs
         pointer = None
@@ -357,9 +393,26 @@ if tasks_to_schedule:
             print(f"⚠️ No gap; defaulting {tid} to {due} at {pointer.time()}")
         
         print(f"🎯 Final for {tid}: date={due}, start={pointer.time()}, dur={dur}m")
+        
+        # Use the correct priority from AI assignment or original task
+        priority = a.get('priority')
+        
+        # Create update payload with duration and priority
+        update_payload = {
+            "due_datetime": pointer.isoformat(),
+            "duration": dur,
+            "duration_unit": "minute"
+        }
+        
+        # Only include priority if it was specified
+        if priority:
+            update_payload["priority"] = priority
+            
+        # Update the task
         requests.post(
-            f"{TODOIST_BASE}/tasks/{tid}", headers=HEADERS,
-            json={"due_datetime": pointer.isoformat(), "duration": dur, "duration_unit": "minute"}
+            f"{TODOIST_BASE}/tasks/{tid}", 
+            headers=HEADERS,
+            json=update_payload
         ).raise_for_status()
         
         dslot = date.fromisoformat(due)
@@ -377,7 +430,7 @@ elif isinstance(data2, list):
 else:
     tasks_list2 = []
 tasks_today = [
-    {"id": str(t['id']), "priority": t.get('priority', 4)}
+    {"id": str(t['id']), "priority": t.get('priority', 1)}
     for t in tasks_list2
     if (t.get('due') or {}).get('date') == today.isoformat()
 ]
