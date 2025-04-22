@@ -144,10 +144,10 @@ def get_calendar_busy() -> dict:
                 s = datetime.fromisoformat(sf["dateTime"]).astimezone(tz)
                 e = datetime.fromisoformat(ef["dateTime"]).astimezone(tz)
                 busy[d].append((s, e))
-                print(f"📅 Found busy slot on {d}: {s.time()} to {e.time()}: {summary}")
+                print(f"Found busy slot on {d}: {s.time()} to {e.time()}: {summary}")
             elif "date" in sf and "date" in ef:
                 busy[d].append((tz.localize(datetime.combine(d, work_start)), tz.localize(datetime.combine(d, work_end))))
-                print(f"📅 Found all-day event on {d}: {summary}")
+                print(f"Found all-day event on {d}: {summary}")
     
     # Also check keagan@togetherplatform.com explicitly if it's different from work_calendar_id
     if cal_id != "keagan@togetherplatform.com":
@@ -175,10 +175,10 @@ def get_calendar_busy() -> dict:
                         s = datetime.fromisoformat(sf["dateTime"]).astimezone(tz)
                         e = datetime.fromisoformat(ef["dateTime"]).astimezone(tz)
                         busy[d].append((s, e))
-                        print(f"📅 Found busy slot on {d} from personal calendar: {s.time()} to {e.time()}: {summary}")
+                        print(f"Found busy slot on {d} from personal calendar: {s.time()} to {e.time()}: {summary}")
                     elif "date" in sf and "date" in ef:
                         busy[d].append((tz.localize(datetime.combine(d, work_start)), tz.localize(datetime.combine(d, work_end))))
-                        print(f"📅 Found all-day event on {d} from personal calendar: {summary}")
+                        print(f"Found all-day event on {d} from personal calendar: {summary}")
         except Exception as e:
             print(f"⚠️ Error accessing personal calendar: {str(e)}")
     
