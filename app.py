@@ -158,9 +158,14 @@ async def webhook_ping():
     return PlainTextResponse("OK", status_code=200)
 
 # ── Incoming Todoist webhooks ──
+# Update your webhook handler to log more diagnostic information
 @app.post("/webhook")
 async def todoist_webhook(req: Request):
     global last_scheduler_run
+    
+    # Log the request headers for debugging
+    headers = dict(req.headers)
+    print(f"📨 Webhook request headers: {json.dumps(headers)}")
     
     try:
         data = await req.json()
@@ -168,35 +173,60 @@ async def todoist_webhook(req: Request):
         body = await req.body()
         print("🛠️ Failed to parse JSON, raw body:", body)
         return PlainTextResponse("invalid payload", status_code=400)
-    print("🛠️ Raw Todoist webhook payload:", json.dumps(data))
-
+    
+    # Log the complete webhook for analysis
+    print(f"📥 Full webhook payload: {json.dumps(data)}")
+    
+    # Extract key information
     event = data.get("event_name")
     event_data = data.get("event_data", {})
-    print(f"🛠️ event_name={event}, event_data={event_data}")
-
+    event_data_extra = data.get("event_data_extra", {})
+    task_id = event_data.get("id", "unknown")
+    update_intent = event_data_extra.get("update_intent", "unknown")
+    triggered_at = data.get("triggered_at", "")
+    
+    print(f"📊 Webhook analysis: event={event}, task={task_id}, update_intent={update_intent}, triggered={triggered_at}")
+    
+    # Check if this is a new task or a legitimate update
+    is_new = False
+    if "old_item" in event_data_extra:
+        old_item = event_data_extra.get("old_item", {})
+        # Compare updated fields to see what actually changed
+        changed_fields = []
+        for key, value in event_data.items():
+            if key in old_item and old_item[key] != value:
+                changed_fields.append(key)
+        
+        print(f"🔄 Changed fields: {changed_fields}")
+        is_new = len(changed_fields) > 0
+    
+    # Standard processing
     payload_proj = event_data.get("project_id")
-    print(f"🛠️ payload project_id={payload_proj}, configured PROJECT_ID={PROJECT_ID}")
     if payload_proj != PROJECT_ID:
         print(f"🛠️ Ignoring webhook for project {payload_proj}")
         return PlainTextResponse("ignored", status_code=200)
-
-    task_id = event_data.get("id")
-    print("📬 Webhook received for project event", event, "task:", task_id)
-
-    # Apply a reasonable debounce for scheduler runs (5 minutes)
-    current_time = datetime.utcnow()
-    if (current_time - last_scheduler_run).total_seconds() < 300:  # 5 minutes
-        print("⏭️ Skipping webhook - scheduler was recently run")
-        return PlainTextResponse("debounced", status_code=200)
+    
+    # If this is not a genuine update, acknowledge but don't process
+    if not is_new and event == "item:updated":
+        print(f"⚠️ Webhook appears to be a duplicate or retry - no actual changes detected")
+        return PlainTextResponse("OK", status_code=200)
+    
+    print("📬 Processing webhook for", event, "task:", task_id)
+    
+    # Apply a reasonable debounce for scheduler runs
+    if (datetime.utcnow() - last_scheduler_run).total_seconds() < 300:  # 5 minutes
+        print("⏭️ Skipping scheduler - was recently run")
+        return PlainTextResponse("OK", status_code=200)
     
     # Update the last run time
-    last_scheduler_run = current_time
+    last_scheduler_run = datetime.utcnow()
     
     # Run the scheduler
     env = os.environ.copy()
     env["TODOIST_API_TOKEN"] = store.get("access_token", STATIC_TOKEN)
     subprocess.Popen(["python", "ai_scheduler.py"], env=env)
-
+    
+    # Always return a clean 200 OK to prevent retries
     return PlainTextResponse("OK", status_code=200)
 
 # ── Google Calendar push notifications ──
